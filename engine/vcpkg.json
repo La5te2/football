@@ -1,0 +1,20 @@
+{
+  "name": "gfootball-engine",
+  "version-string": "2.10.3",
+  "dependencies": [
+    "boost-algorithm",
+    "boost-bind",
+    "boost-circular-buffer",
+    "boost-filesystem",
+    "boost-random",
+    "boost-signals2",
+    "boost-smart-ptr",
+    "boost-system",
+    "boost-thread",
+    "sdl2",
+    "sdl2-image",
+    "sdl2-ttf",
+    "sdl2-gfx",
+    "opengl"
+  ]
+}

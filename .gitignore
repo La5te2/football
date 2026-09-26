@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+build/
+dist/
+
+# Project-local environments, caches, and runtime output
+.local/
+.research/
+.venv/
+football-env*/
+checkpoints/
+matches/
+/bin/
+
+# Local model weights are preserved but distributed separately.
+/models/**/*.pth
+/models/**/*.pt
+
+# CMake and vcpkg
+CMakeCache.txt
+CMakeFiles/
+Testing/
+cmake-build-*/
+cmake_install.cmake
+Makefile
+engine/.cmake/
+engine/build*/
+engine/vcpkg_installed/
+vcpkg_installed/
+*.a
+*.cbp
+*.dll
+*.dylib
+*.exp
+*.exe
+*.ilk
+*.lib
+*.obj
+*.pdb
+*.pyd
+*.so
+
+# Editors and operating systems
+.idea/
+.vs*/
+.vscode/
+.DS_Store
+Thumbs.db
