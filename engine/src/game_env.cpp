@@ -236,6 +236,68 @@ void GameEnv::load_model(const std::filesystem::path& path, bool left_team,
       std::make_unique<Model>(path, left_team, controller, game_duration));
 }
 
+void GameEnv::start_recording(const std::filesystem::path& path,
+                              const std::string& initial_state,
+                              bool left_external, bool right_external,
+                              int match_duration) {
+  if (replay_game_) {
+    throw std::runtime_error("Cannot record while replaying a match");
+  }
+  replay_writer_ = std::make_unique<ReplayWriter>(
+      path, initial_state,
+      std::array<std::uint8_t, 2>{left_external, right_external},
+      match_duration);
+}
+
+void GameEnv::begin_recording_game() {
+  if (replay_writer_) replay_writer_->BeginGame();
+}
+
+void GameEnv::finish_recording_game(const SharedInfo& final_state) {
+  if (!replay_writer_) return;
+  replay_writer_->FinishGame(
+      final_state.step,
+      std::array<std::int32_t, 2>{final_state.left_goals,
+                                  final_state.right_goals});
+}
+
+void GameEnv::finish_recording() {
+  if (replay_writer_) replay_writer_->Finish();
+}
+
+void GameEnv::start_replay(const ReplayGame& game) {
+  if (!models_.empty() || replay_writer_) {
+    throw std::runtime_error("Replay requires an environment without models");
+  }
+  replay_game_ = &game;
+  replay_step_index_ = 0;
+}
+
+bool GameEnv::replay_complete() const {
+  return replay_game_ && replay_step_index_ == replay_game_->steps.size();
+}
+
+void GameEnv::reset_models() {
+  for (auto& model : models_) model->Reset();
+}
+
+void GameEnv::record_model_decision(
+    bool left_team, const GFootballModelObservation& observation,
+    const GFootballModelDecision& decision) {
+  if (!replay_writer_) return;
+  if (!recording_step_active_) {
+    throw std::runtime_error("Model decision occurred outside a replay step");
+  }
+  const int side = left_team ? 0 : 1;
+  if (recording_step_.has_decision[side]) {
+    throw std::runtime_error("Replay supports one model controller per team");
+  }
+  recording_step_.has_observation[side] = 1;
+  recording_step_.observations[side] = observation;
+  recording_step_.has_decision[side] = 1;
+  recording_step_.decisions[side] = decision;
+}
+
 void GameEnv::action(int action, bool left_team, int player) {
   SetGame(this);
   int input_id = player + (left_team ? 0 : 11);
@@ -372,8 +434,45 @@ void GameEnv::step() {
   timing_reset_requested_ = false;
   if (context->gameTask->GetMatch()->IsInPlay()) {
     const SharedInfo model_state = get_info();
-    for (auto& model : models_) {
-      model->Decide(*this, model_state);
+    if (replay_game_) {
+      if (replay_step_index_ >= replay_game_->steps.size()) {
+        throw std::runtime_error("Replay ended before the match state");
+      }
+      const ReplayStep& replay_step =
+          replay_game_->steps.at(replay_step_index_++);
+      if (replay_step.step != model_state.step) {
+        throw std::runtime_error("Replay step does not match the engine state");
+      }
+      for (int side = 0; side < 2; ++side) {
+        if (!replay_step.has_decision[side]) continue;
+        const GFootballModelDecision& decision = replay_step.decisions[side];
+        if (decision.controlled_player < 0 ||
+            decision.controlled_player >= kGFootballPlayersPerTeam ||
+            decision.action < game_idle || decision.action > game_builtin_ai) {
+          throw std::runtime_error("Replay contains an invalid model decision");
+        }
+        const bool left_team = side == 0;
+        set_controlled_player(left_team, 0, decision.controlled_player);
+        action(decision.action, left_team, 0);
+      }
+    } else if (replay_writer_) {
+      recording_step_ = ReplayStep{};
+      recording_step_.step = model_state.step;
+      recording_step_active_ = true;
+      try {
+        for (auto& model : models_) {
+          model->Decide(*this, model_state);
+        }
+        replay_writer_->Record(recording_step_);
+        recording_step_active_ = false;
+      } catch (...) {
+        recording_step_active_ = false;
+        throw;
+      }
+    } else {
+      for (auto& model : models_) {
+        model->Decide(*this, model_state);
+      }
     }
   }
   // We do 10 environment steps per second, while game does 100 frames of

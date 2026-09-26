@@ -31,9 +31,9 @@ endif()
 add_subdirectory(engine)
 add_subdirectory(models/tamakeri)
 
-set_target_properties(gfootball tamakeri PROPERTIES
+set_target_properties(gfootball replay tamakeri PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/runtime")
 foreach(configuration DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
-  set_target_properties(gfootball tamakeri PROPERTIES
+  set_target_properties(gfootball replay tamakeri PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_${configuration} "${CMAKE_BINARY_DIR}/runtime")
 endforeach()

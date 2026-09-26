@@ -1,6 +1,6 @@
 # A Modified Gameplay Football
 
-This repository contains a native 11-vs-11 football simulation based on the open-source Gameplay Football engine. It provides an OpenGL match executable, built-in team AI, and eternal model plugin support.
+This repository contains a native 11-vs-11 football simulation based on the open-source Gameplay Football engine. It provides an OpenGL match executable, built-in team AI, and external model plugin support.
 
 Useful links:
 
@@ -39,7 +39,13 @@ Running the executable without side options starts built-in AI versus built-in A
 Use `--left` and `--right` to assign either `builtin` or a model plugin before the match starts:
 
 ```powershell
-.\bin\gfootball.exe --left eternal-model.dll --right builtin
+.\bin\gfootball.exe --left external-model.dll --right builtin
+```
+
+Use `--games <positive-integer>` to run several matches from the same initial state before the executable exits:
+
+```powershell
+.\bin\gfootball.exe --games 10 --render=false --real_time=false
 ```
 
 In a rendered match, press Space to pause or resume. Use `[` and `]` to select 0.25x, 0.5x, 1x, or 2x playback. These controls affect presentation timing only; simulation steps and model decisions retain their original cadence.
@@ -48,9 +54,25 @@ The same controller options apply to headless matches:
 
 ```powershell
 .\bin\gfootball.exe --render=false --real_time=false `
-  --left eternal-model.dll `
-  --right eternal-model.dll
+  --left external-model.dll `
+  --right external-model.dll
 ```
+
+Add `--record <file>` to save the requested matches in one replay file. The option is inactive unless it is specified:
+
+```powershell
+.\bin\gfootball.exe --games 10 --record matches.gfr `
+  --left external-model.dll `
+  --right builtin
+```
+
+Replay files are rendered by the separate replay executable:
+
+```powershell
+.\bin\replay.exe matches.gfr
+```
+
+The replay executable plays every recorded match in order. The pause and playback-speed controls used during a live match also apply to replay rendering.
 
 ## License
 

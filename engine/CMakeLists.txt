@@ -95,6 +95,8 @@ target_link_libraries(gfootball_engine INTERFACE
 
 add_executable(gfootball src/gfootball.cpp)
 target_link_libraries(gfootball PRIVATE gfootball_engine)
+add_executable(replay src/replaymain.cpp)
+target_link_libraries(replay PRIVATE gfootball_engine)
 if(WIN32)
-  set_target_properties(gfootball PROPERTIES WIN32_EXECUTABLE TRUE)
+  set_target_properties(gfootball replay PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()

@@ -160,6 +160,7 @@ void Model::Decide(GameEnv& env, const SharedInfo& state) {
   if (decision.action < game_idle || decision.action > game_builtin_ai) {
     throw std::runtime_error("Model plugin returned an invalid action");
   }
+  env.record_model_decision(left_team_, observation, decision);
   env.set_controlled_player(left_team_, controller_,
                             decision.controlled_player);
   env.action(decision.action, left_team_, controller_);

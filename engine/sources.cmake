@@ -235,12 +235,14 @@ set(ENGINE_HEADERS
    src/game_env.hpp
    src/model.hpp
    src/interface.hpp
+   src/replay.hpp
 )
 
 set(ENGINE_SOURCES
    src/ai/external_input.cpp
    src/game_env.cpp
    src/model.cpp
+   src/replay.cpp
 )
 
 set(CORE_HEADERS

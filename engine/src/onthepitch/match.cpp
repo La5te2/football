@@ -34,7 +34,6 @@
 #include "player/playerofficial.hpp"
 #include "proceduralpitch.hpp"
 
-constexpr unsigned int replaySize_ms = 10000;
 constexpr unsigned int camPosSize = 150;
 
 boost::shared_ptr<AnimCollection> Match::GetAnimCollection() {
@@ -1690,11 +1689,6 @@ void Match::FollowCamera(Quaternion &orientation, Quaternion &nodeOrientation,
   nodeOrientation.SetAngleAxis(targetPosition.GetAngle2D() + 1.5 * pi, Vector3(0, 0, 1));
   position = targetPosition - targetPosition.Get2D().GetNormalized(Vector3(0, -1, 0)) * 10 * (1.0f / zoom) + Vector3(0, 0, 3);
   FOV = 60.0f;
-}
-
-int Match::GetReplaySize_ms() {
-  DO_VALIDATION;
-  return replaySize_ms;
 }
 
 void Match::PrepareGoalNetting() {

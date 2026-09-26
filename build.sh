@@ -10,6 +10,7 @@ cmake --build "$BUILD_DIR" --parallel
 
 mkdir -p "$RUNTIME_DIR" "$ROOT/models/tamakeri"
 cp "$BUILD_DIR/runtime/gfootball" "$RUNTIME_DIR/"
+cp "$BUILD_DIR/runtime/replay" "$RUNTIME_DIR/"
 cp "$BUILD_DIR/runtime"/libtamakeri.* "$ROOT/models/tamakeri/"
 cp -R "$ROOT/engine/data" "$RUNTIME_DIR/"
 cp -R "$ROOT/engine/fonts" "$RUNTIME_DIR/"

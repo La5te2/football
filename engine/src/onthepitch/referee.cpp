@@ -146,7 +146,6 @@ void Referee::Process() {
           DO_VALIDATION;
           buffer.desiredSetPiece = e_GameMode_KickOff;
           buffer.stopTime = match->GetActualTime_ms();
-          // Number of ms for replay.
           buffer.prepareTime = match->GetActualTime_ms() + 500;
           if (!animations) {
             match->BumpActualTime_ms(400);

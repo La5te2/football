@@ -1,6 +1,7 @@
 // Copyright 2026 gfootball contributors
 // Licensed under the Apache License, Version 2.0.
 
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -87,6 +88,14 @@ bool IsBuiltin(const std::string& side) {
   return side == "builtin";
 }
 
+bool ParsePositiveInteger(const std::string& value, int& result) {
+  result = 0;
+  const auto parsed =
+      std::from_chars(value.data(), value.data() + value.size(), result);
+  return parsed.ec == std::errc{} &&
+         parsed.ptr == value.data() + value.size() && result > 0;
+}
+
 std::filesystem::path ResolvePlugin(const std::string& value,
                                     const std::filesystem::path& root) {
   std::filesystem::path path = value;
@@ -114,6 +123,8 @@ void LoadModels(GameEnv& env, const std::string& left,
 int main(int argc, char** argv) {
   std::string left = "builtin";
   std::string right = "builtin";
+  std::filesystem::path record_path;
+  int games = 1;
   bool render = true;
   bool real_time = true;
   for (int i = 1; i < argc; ++i) {
@@ -126,6 +137,20 @@ int main(int argc, char** argv) {
       left = argument.substr(7);
     } else if (argument.rfind("--right=", 0) == 0) {
       right = argument.substr(8);
+    } else if (argument == "--record" && i + 1 < argc) {
+      record_path = argv[++i];
+    } else if (argument.rfind("--record=", 0) == 0) {
+      record_path = argument.substr(9);
+    } else if (argument == "--games" && i + 1 < argc) {
+      if (!ParsePositiveInteger(argv[++i], games)) {
+        ShowError("--games requires a positive integer");
+        return 2;
+      }
+    } else if (argument.rfind("--games=", 0) == 0) {
+      if (!ParsePositiveInteger(argument.substr(8), games)) {
+        ShowError("--games requires a positive integer");
+        return 2;
+      }
     } else if (argument == "--render=false") {
       render = false;
     } else if (argument == "--real_time=false") {
@@ -197,14 +222,34 @@ int main(int argc, char** argv) {
     }
 
     LoadModels(*env, left, right, root);
-    while (!env->window_closed()) {
-      int step;
-      {
-        ContextHolder context(env);
-        env->step();
-        step = env->get_info().step;
+    const std::string initial_state = env->get_state("");
+    if (!record_path.empty()) {
+      env->start_recording(record_path, initial_state,
+                           !IsBuiltin(left), !IsBuiltin(right),
+                           kMatchDurationSteps);
+    }
+    for (int game = 0; game < games && !env->window_closed(); ++game) {
+      if (game > 0) {
+        {
+          ContextHolder context(env);
+          env->set_state(initial_state);
+        }
+        env->reset_models();
       }
-      if (step >= kMatchDurationSteps) break;
+      env->begin_recording_game();
+      SharedInfo final_state;
+      while (!env->window_closed()) {
+        {
+          ContextHolder context(env);
+          env->step();
+          final_state = env->get_info();
+        }
+        if (final_state.step >= kMatchDurationSteps) break;
+      }
+      env->finish_recording_game(final_state);
+    }
+    if (!record_path.empty()) {
+      env->finish_recording();
     }
   } catch (const std::exception& error) {
     ShowError(error.what());

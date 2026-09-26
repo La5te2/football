@@ -21,6 +21,7 @@
 #include "gamedefines.hpp"
 #include "gfootball_actions.h"
 #include "main.hpp"
+#include "replay.hpp"
 
 class ExternalInput;
 class GameTask;
@@ -65,6 +66,20 @@ struct GameEnv {
   bool set_controlled_player(bool left_team, int controller, int player);
   void load_model(const std::filesystem::path& path, bool left_team,
                   int controller, int game_duration);
+  void start_recording(const std::filesystem::path& path,
+                       const std::string& initial_state,
+                       bool left_external, bool right_external,
+                       int match_duration);
+  void begin_recording_game();
+  void finish_recording_game(const SharedInfo& final_state);
+  void finish_recording();
+  void start_replay(const ReplayGame& game);
+  bool replay_complete() const;
+  // Resets every loaded external model instance on both teams.
+  void reset_models();
+  void record_model_decision(
+      bool left_team, const GFootballModelObservation& observation,
+      const GFootballModelDecision& decision);
   void reset(ScenarioConfig& game_config, bool init_animation);
   void render(bool swap_buffer = true);
   std::string get_state(const std::string& pickle);
@@ -86,6 +101,11 @@ struct GameEnv {
   bool timing_reset_requested_ = false;
   int playback_rate_index_ = 2;
   std::vector<std::unique_ptr<Model>> models_;
+  std::unique_ptr<ReplayWriter> replay_writer_;
+  const ReplayGame* replay_game_ = nullptr;
+  std::size_t replay_step_index_ = 0;
+  ReplayStep recording_step_;
+  bool recording_step_active_ = false;
  public:
   ScenarioConfig scenario_config;
   GameConfig game_config;

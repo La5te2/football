@@ -142,8 +142,6 @@ class Match {
 
     void SetAutoUpdateIngameCamera(bool autoUpdate = true) { DO_VALIDATION; if (autoUpdate != autoUpdateIngameCamera) { DO_VALIDATION; camPos.clear(); autoUpdateIngameCamera = autoUpdate; } }
 
-    int GetReplaySize_ms();
-
     MatchData* GetMatchData() { DO_VALIDATION; return matchData; }
 
     float GetMatchDurationFactor() const { return matchDurationFactor; }

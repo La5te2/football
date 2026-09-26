@@ -26,6 +26,7 @@ if errorlevel 1 exit /b 1
 
 if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
 copy /Y "%BUILD_DIR%\runtime\gfootball.exe" "%RUNTIME_DIR%\" >nul
+copy /Y "%BUILD_DIR%\runtime\replay.exe" "%RUNTIME_DIR%\" >nul
 for %%F in ("%BUILD_DIR%\runtime\*.dll") do (
   if /I not "%%~nxF"=="tamakeri.dll" copy /Y "%%~fF" "%RUNTIME_DIR%\" >nul
 )
