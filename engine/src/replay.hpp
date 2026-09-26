@@ -25,6 +25,8 @@ struct ReplayStep {
 
 // One complete match within a replay file.
 struct ReplayGame {
+  std::uint32_t seed = 0;
+  std::string initial_state;
   std::int32_t final_step = 0;
   std::array<std::int32_t, 2> goals{};
   std::vector<ReplayStep> steps;
@@ -33,14 +35,13 @@ struct ReplayGame {
 class ReplayWriter final {
  public:
   ReplayWriter(const std::filesystem::path& path,
-               const std::string& initial_state,
                const std::array<std::uint8_t, 2>& external_teams,
                std::int32_t match_duration);
   ~ReplayWriter();
   ReplayWriter(const ReplayWriter&) = delete;
   ReplayWriter& operator=(const ReplayWriter&) = delete;
 
-  void BeginGame();
+  void BeginGame(std::uint32_t seed, const std::string& initial_state);
   void Record(const ReplayStep& step);
   void FinishGame(std::int32_t final_step,
                   const std::array<std::int32_t, 2>& goals);
@@ -65,14 +66,12 @@ class ReplayReader final {
  public:
   explicit ReplayReader(const std::filesystem::path& path);
 
-  const std::string& initial_state() const { return initial_state_; }
   bool external_team(int side) const { return external_teams_.at(side) != 0; }
   std::int32_t match_duration() const { return match_duration_; }
   std::size_t game_count() const { return games_.size(); }
   const ReplayGame& game(std::size_t index) const { return games_.at(index); }
 
  private:
-  std::string initial_state_;
   std::array<std::uint8_t, 2> external_teams_{};
   std::int32_t match_duration_ = 0;
   std::vector<ReplayGame> games_;

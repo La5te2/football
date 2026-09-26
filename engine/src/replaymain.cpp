@@ -132,32 +132,26 @@ int main(int argc, char** argv) {
     env->state = game_running;
     if (render) env->game_config.render_frames_per_step = 6;
     env->reset(*config, false);
-    {
-      ContextHolder context(env.get());
-      env->set_state(replay.initial_state());
-      env->scenario_config.real_time = real_time;
-      env->get_info();
-      if (render) {
-        env->get_frame();
-        env->render(false);
-        env->render(true);
-      }
-    }
 
     for (std::size_t game_index = 0;
          game_index < replay.game_count() && !env->window_closed();
          ++game_index) {
-      if (game_index > 0) {
+      const ReplayGame& game = replay.game(game_index);
+      {
         ContextHolder context(env.get());
-        env->set_state(replay.initial_state());
+        env->set_state(game.initial_state);
+        if (env->scenario_config.game_engine_random_seed != game.seed) {
+          throw std::runtime_error(
+              "Replay seed does not match its initial state");
+        }
         env->scenario_config.real_time = real_time;
+        env->get_info();
         if (render) {
           env->get_frame();
           env->render(false);
           env->render(true);
         }
       }
-      const ReplayGame& game = replay.game(game_index);
       env->start_replay(game);
       SharedInfo state;
       {

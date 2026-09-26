@@ -142,9 +142,9 @@ ReplayStep ReadStep(std::istream& stream) {
 
 }  // namespace
 
-// Writes a replay header and the full state from which playback begins.
+// Writes file-level metadata shared by every recorded match.
 ReplayWriter::ReplayWriter(
-    const std::filesystem::path& path, const std::string& initial_state,
+    const std::filesystem::path& path,
     const std::array<std::uint8_t, 2>& external_teams,
     std::int32_t match_duration)
     : stream_(path, std::ios::binary | std::ios::trunc),
@@ -153,8 +153,8 @@ ReplayWriter::ReplayWriter(
   if (!stream_) {
     throw std::runtime_error("Unable to create replay file: " + path.string());
   }
-  if (initial_state.empty() || match_duration <= 0 ||
-      external_teams[0] > 1 || external_teams[1] > 1) {
+  if (match_duration <= 0 || external_teams[0] > 1 ||
+      external_teams[1] > 1) {
     throw std::runtime_error("Invalid replay recording metadata");
   }
   stream_.write(kReplayMagic.data(), kReplayMagic.size());
@@ -164,24 +164,25 @@ ReplayWriter::ReplayWriter(
   WriteValue(stream_, match_duration);
   game_count_offset_ = stream_.tellp();
   WriteValue(stream_, std::int32_t{0});
-  WriteValue(stream_, static_cast<std::uint64_t>(initial_state.size()));
-  stream_.write(initial_state.data(),
-                static_cast<std::streamsize>(initial_state.size()));
-  if (!stream_) throw std::runtime_error("Unable to write replay state");
 }
 
 ReplayWriter::~ReplayWriter() = default;
 
 // Starts a separately indexed match section in the replay stream.
-void ReplayWriter::BeginGame() {
+void ReplayWriter::BeginGame(std::uint32_t seed,
+                             const std::string& initial_state) {
   if (finished_) throw std::runtime_error("Replay recording is already finished");
   if (game_active_) throw std::runtime_error("A replay game is already active");
   if (game_count_ >= kMaximumGameCount) {
     throw std::runtime_error("Replay contains too many games");
   }
+  if (initial_state.empty() || initial_state.size() > kMaximumStateSize) {
+    throw std::runtime_error("Invalid replay game state");
+  }
   stream_.write(kGameMagic.data(), kGameMagic.size());
   if (!stream_) throw std::runtime_error("Unable to write replay game header");
   WriteValue(stream_, game_count_);
+  WriteValue(stream_, seed);
   current_step_count_offset_ = stream_.tellp();
   WriteValue(stream_, std::int32_t{0});
   current_final_step_offset_ = stream_.tellp();
@@ -189,6 +190,10 @@ void ReplayWriter::BeginGame() {
   current_goals_offset_ = stream_.tellp();
   WriteValue(stream_, std::int32_t{0});
   WriteValue(stream_, std::int32_t{0});
+  WriteValue(stream_, static_cast<std::uint64_t>(initial_state.size()));
+  stream_.write(initial_state.data(),
+                static_cast<std::streamsize>(initial_state.size()));
+  if (!stream_) throw std::runtime_error("Unable to write replay game state");
   current_step_count_ = 0;
   last_recorded_step_ = -1;
   game_active_ = true;
@@ -268,15 +273,10 @@ ReplayReader::ReplayReader(const std::filesystem::path& path) {
   }
   match_duration_ = ReadValue<std::int32_t>(stream);
   const std::int32_t game_count = ReadValue<std::int32_t>(stream);
-  const std::uint64_t state_size = ReadValue<std::uint64_t>(stream);
   if (match_duration_ <= 0 || game_count <= 0 ||
-      game_count > kMaximumGameCount || state_size == 0 ||
-      state_size > kMaximumStateSize) {
+      game_count > kMaximumGameCount) {
     throw std::runtime_error("Invalid replay metadata");
   }
-  initial_state_.resize(static_cast<std::size_t>(state_size));
-  stream.read(initial_state_.data(), static_cast<std::streamsize>(state_size));
-  if (!stream) throw std::runtime_error("Replay state is truncated");
 
   games_.reserve(static_cast<std::size_t>(game_count));
   for (std::int32_t game_index = 0; game_index < game_count; ++game_index) {
@@ -286,16 +286,23 @@ ReplayReader::ReplayReader(const std::filesystem::path& path) {
         ReadValue<std::int32_t>(stream) != game_index) {
       throw std::runtime_error("Invalid replay game boundary");
     }
-    const std::int32_t step_count = ReadValue<std::int32_t>(stream);
     ReplayGame game;
+    game.seed = ReadValue<std::uint32_t>(stream);
+    const std::int32_t step_count = ReadValue<std::int32_t>(stream);
     game.final_step = ReadValue<std::int32_t>(stream);
     game.goals[0] = ReadValue<std::int32_t>(stream);
     game.goals[1] = ReadValue<std::int32_t>(stream);
+    const std::uint64_t state_size = ReadValue<std::uint64_t>(stream);
     if (step_count <= 0 || step_count > kMaximumStepCount ||
         game.final_step <= 0 || game.final_step > match_duration_ ||
-        game.goals[0] < 0 || game.goals[1] < 0) {
+        game.goals[0] < 0 || game.goals[1] < 0 || state_size == 0 ||
+        state_size > kMaximumStateSize) {
       throw std::runtime_error("Invalid replay game metadata");
     }
+    game.initial_state.resize(static_cast<std::size_t>(state_size));
+    stream.read(game.initial_state.data(),
+                static_cast<std::streamsize>(state_size));
+    if (!stream) throw std::runtime_error("Replay game state is truncated");
     game.steps.reserve(static_cast<std::size_t>(step_count));
     for (std::int32_t step_index = 0; step_index < step_count; ++step_index) {
       ReplayStep value = ReadStep(stream);

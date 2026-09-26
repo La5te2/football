@@ -2,11 +2,14 @@
 // Licensed under the Apache License, Version 2.0.
 
 #include <charconv>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <string>
+#include <unordered_set>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -224,19 +227,32 @@ int main(int argc, char** argv) {
     LoadModels(*env, left, right, root);
     const std::string initial_state = env->get_state("");
     if (!record_path.empty()) {
-      env->start_recording(record_path, initial_state,
-                           !IsBuiltin(left), !IsBuiltin(right),
+      env->start_recording(record_path, !IsBuiltin(left), !IsBuiltin(right),
                            kMatchDurationSteps);
     }
+    std::random_device entropy;
+    std::seed_seq seed_material{
+        entropy(), entropy(), entropy(), entropy(),
+        entropy(), entropy(), entropy(), entropy()};
+    std::mt19937 seed_generator(seed_material);
+    std::unordered_set<std::uint32_t> used_seeds;
     for (int game = 0; game < games && !env->window_closed(); ++game) {
       if (game > 0) {
-        {
-          ContextHolder context(env);
-          env->set_state(initial_state);
-        }
-        env->reset_models();
+        ContextHolder context(env);
+        env->set_state(initial_state);
       }
-      env->begin_recording_game();
+      std::uint32_t game_seed;
+      do {
+        game_seed = seed_generator();
+      } while (!used_seeds.insert(game_seed).second);
+      {
+        ContextHolder context(env);
+        env->set_random_seed(game_seed);
+      }
+      env->reset_models();
+      if (!record_path.empty()) {
+        env->begin_recording_game(game_seed, env->get_state(""));
+      }
       SharedInfo final_state;
       while (!env->window_closed()) {
         {

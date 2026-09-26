@@ -44,6 +44,8 @@ Use `--left` and `--right` to assign either `builtin` or a model plugin before t
 
 Use `--games <positive-integer>` to run several matches from the same initial state before the executable exits:
 
+Each match keeps the same physical initial state and uses a distinct random seed. Replay files store every match's seed and serialized initial state for exact playback.
+
 ```powershell
 .\bin\gfootball.exe --games 10 --render=false --real_time=false
 ```

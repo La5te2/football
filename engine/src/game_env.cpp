@@ -237,20 +237,19 @@ void GameEnv::load_model(const std::filesystem::path& path, bool left_team,
 }
 
 void GameEnv::start_recording(const std::filesystem::path& path,
-                              const std::string& initial_state,
                               bool left_external, bool right_external,
                               int match_duration) {
   if (replay_game_) {
     throw std::runtime_error("Cannot record while replaying a match");
   }
   replay_writer_ = std::make_unique<ReplayWriter>(
-      path, initial_state,
-      std::array<std::uint8_t, 2>{left_external, right_external},
+      path, std::array<std::uint8_t, 2>{left_external, right_external},
       match_duration);
 }
 
-void GameEnv::begin_recording_game() {
-  if (replay_writer_) replay_writer_->BeginGame();
+void GameEnv::begin_recording_game(std::uint32_t seed,
+                                   const std::string& initial_state) {
+  if (replay_writer_) replay_writer_->BeginGame(seed, initial_state);
 }
 
 void GameEnv::finish_recording_game(const SharedInfo& final_state) {
@@ -279,6 +278,12 @@ bool GameEnv::replay_complete() const {
 
 void GameEnv::reset_models() {
   for (auto& model : models_) model->Reset();
+}
+
+void GameEnv::set_random_seed(std::uint32_t seed) {
+  SetGame(this);
+  scenario_config.game_engine_random_seed = seed;
+  randomize(seed);
 }
 
 void GameEnv::record_model_decision(

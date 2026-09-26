@@ -67,16 +67,18 @@ struct GameEnv {
   void load_model(const std::filesystem::path& path, bool left_team,
                   int controller, int game_duration);
   void start_recording(const std::filesystem::path& path,
-                       const std::string& initial_state,
                        bool left_external, bool right_external,
                        int match_duration);
-  void begin_recording_game();
+  void begin_recording_game(std::uint32_t seed,
+                            const std::string& initial_state);
   void finish_recording_game(const SharedInfo& final_state);
   void finish_recording();
   void start_replay(const ReplayGame& game);
   bool replay_complete() const;
   // Resets every loaded external model instance on both teams.
   void reset_models();
+  // Selects the existing engine random stream for one match.
+  void set_random_seed(std::uint32_t seed);
   void record_model_decision(
       bool left_team, const GFootballModelObservation& observation,
       const GFootballModelDecision& decision);
