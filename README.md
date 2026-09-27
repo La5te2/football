@@ -11,14 +11,15 @@ We thank Bastiaan Konings Schuiling, who authored and open-sourced Gameplay Foot
 
 ## Building
 
-The Windows build requires a 64-bit Visual Studio C++ toolchain, CMake, vcpkg, and Torch. Set `VCPKG_ROOT` to the vcpkg checkout before building:
+The Windows build requires a 64-bit Visual Studio C++ toolchain, CMake, vcpkg, Python, and Torch. Set `VCPKG_ROOT` to the vcpkg checkout and install the native dependencies:
 
 ```powershell
 $env:VCPKG_ROOT = '<path-to-vcpkg>'
+& "$env:VCPKG_ROOT\vcpkg.exe" install boost-filesystem boost-system boost-thread sdl2 sdl2-image sdl2-ttf sdl2-gfx --triplet x64-windows
 .\build.bat
 ```
 
-CMake obtains the LibTorch package from the active Python `torch` installation by default. Set `GFOOTBALL_TORCH_ROOT` when using a standalone LibTorch distribution.
+CMake obtains the LibTorch package from the `python` interpreter on `PATH` by default. Set `GFOOTBALL_TORCH_ROOT` when using a standalone LibTorch distribution.
 
 On Linux, install the equivalent C++ dependencies and run:
 
