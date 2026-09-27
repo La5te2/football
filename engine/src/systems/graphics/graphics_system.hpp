@@ -48,7 +48,7 @@ namespace blunted {
       virtual void Exit();
       void SetContext();
       void DisableContext();
-      const screenshoot& GetScreen();
+      const Screenshot& GetScreen();
 
       e_SystemType GetSystemType() const;
 

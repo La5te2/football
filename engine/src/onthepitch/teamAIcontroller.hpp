@@ -58,6 +58,7 @@ class TeamAIController {
     void CalculateSituation();
 
     void UpdateTactics();
+    TeamTacticsInfo GetLiveTactics() const;
 
     unsigned long GetEndApplyAttackingRun_ms() { DO_VALIDATION; return endApplyAttackingRun_ms; }
     Player *GetAttackingRunPlayer() { DO_VALIDATION; return attackingRunPlayer; }

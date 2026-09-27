@@ -462,33 +462,26 @@ void ExternalExecutor::Process() {
         allowKeeperRush = false;
       }
 
-      if (input->GetButton(e_ButtonFunction_Pressure) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_Pressure) &&
-          allowPressure) {
+      if (input->GetButton(e_ButtonFunction_Pressure) && allowPressure) {
         DO_VALIDATION;
         actionMode = 1;
         actionButton = e_ButtonFunction_Pressure;
       }
 
-      if (input->GetButton(e_ButtonFunction_Sliding) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_Sliding) &&
-          allowSliding) {
+      if (input->GetButton(e_ButtonFunction_Sliding) && allowSliding) {
         DO_VALIDATION;  // we don't want high passes to turn into slidings
         actionMode = 1;
         actionButton = e_ButtonFunction_Sliding;
       }
 
       if (input->GetButton(e_ButtonFunction_TeamPressure) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_TeamPressure) &&
           allowTeamPressure) {
         DO_VALIDATION;
         actionMode = 1;
         actionButton = e_ButtonFunction_TeamPressure;
       }
 
-      if (input->GetButton(e_ButtonFunction_KeeperRush) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_KeeperRush) &&
-          allowKeeperRush) {
+      if (input->GetButton(e_ButtonFunction_KeeperRush) && allowKeeperRush) {
         DO_VALIDATION;
         actionMode = 1;
         actionButton = e_ButtonFunction_KeeperRush;
@@ -507,32 +500,25 @@ void ExternalExecutor::Process() {
         allowShot = false;
       }
 
-      if (input->GetButton(e_ButtonFunction_ShortPass) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_ShortPass) &&
-          allowShortPass) {
+      if (input->GetButton(e_ButtonFunction_ShortPass) && allowShortPass) {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_ShortPass;
       }
 
-      if (input->GetButton(e_ButtonFunction_LongPass) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_LongPass) &&
-          allowLongPass) {
+      if (input->GetButton(e_ButtonFunction_LongPass) && allowLongPass) {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_LongPass;
       }
 
-      if (input->GetButton(e_ButtonFunction_HighPass) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_HighPass) &&
-          allowHighPass) {
+      if (input->GetButton(e_ButtonFunction_HighPass) && allowHighPass) {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_HighPass;
       }
 
-      if (input->GetButton(e_ButtonFunction_Shot) &&
-          !input->GetPreviousButtonState(e_ButtonFunction_Shot) && allowShot) {
+      if (input->GetButton(e_ButtonFunction_Shot) && allowShot) {
         DO_VALIDATION;
         actionMode = 2;
         actionButton = e_ButtonFunction_Shot;

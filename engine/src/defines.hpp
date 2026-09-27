@@ -57,7 +57,7 @@ constexpr float EPSILON = 0.000001;
 #define Z_FIELD_SCALE 1
 #define MAX_PLAYERS 11
 
-typedef std::string screenshoot;
+using Screenshot = std::string;
 
 using namespace boost::placeholders;
 
@@ -176,7 +176,8 @@ class EnvState {
   void process(void** collection, int size, void*& element);
 };
 
-// 3-d position of object (available from python).
+// Three-dimensional value converted to normalized environment coordinates at
+// public observation boundaries.
 struct Position {
   Position(float x = 0.0, float y = 0.0, float z = 0.0, bool env_coords = false) {
     if (env_coords) {
@@ -255,40 +256,102 @@ struct PlayerInfo {
   PlayerInfo() { }
   PlayerInfo(const PlayerInfo& f) {
     player_position = f.player_position;
-    player_direction = f.player_direction;
+    player_velocity = f.player_velocity;
+    player_facing = f.player_facing;
+    formation_position = f.formation_position;
+    dynamic_formation_position = f.dynamic_formation_position;
     has_card = f.has_card;
     is_active = f.is_active;
+    touch_pending = f.touch_pending;
     tired_factor = f.tired_factor;
     role = f.role;
+    dynamic_role = f.dynamic_role;
+    function_type = f.function_type;
+    action_frame = f.action_frame;
+    touch_frame = f.touch_frame;
+    possession_duration_ms = f.possession_duration_ms;
+    time_to_ball_ms = f.time_to_ball_ms;
   }
   bool operator == (const PlayerInfo& f) const {
     return player_position == f.player_position &&
-        player_direction == f.player_direction &&
+        player_velocity == f.player_velocity &&
+        player_facing == f.player_facing &&
+        formation_position == f.formation_position &&
+        dynamic_formation_position == f.dynamic_formation_position &&
         has_card == f.has_card &&
         is_active == f.is_active &&
+        touch_pending == f.touch_pending &&
         tired_factor == f.tired_factor &&
-        role == f.role;
+        role == f.role &&
+        dynamic_role == f.dynamic_role &&
+        function_type == f.function_type &&
+        action_frame == f.action_frame &&
+        touch_frame == f.touch_frame &&
+        possession_duration_ms == f.possession_duration_ms &&
+        time_to_ball_ms == f.time_to_ball_ms;
   }
   Position player_position;
-  Position player_direction;
+  Position player_velocity;
+  Position player_facing;
+  Position formation_position;
+  Position dynamic_formation_position;
   bool has_card = false;
   bool is_active = true;
+  bool touch_pending = false;
   float tired_factor = 0.0f; // In the [0..1] range.
   e_PlayerRole role = e_PlayerRole_GK;
+  e_PlayerRole dynamic_role = e_PlayerRole_GK;
+  int function_type = 0;
+  int action_frame = 0;
+  int touch_frame = -1;
+  int possession_duration_ms = 0;
+  int time_to_ball_ms = 0;
+};
+
+struct TeamTacticsInfo {
+  float offense_depth_factor = 0.0f;
+  float defense_depth_factor = 0.0f;
+  float offense_width_factor = 0.0f;
+  float defense_width_factor = 0.0f;
+  float offense_own_half_factor = 0.0f;
+  float defense_own_half_factor = 0.0f;
+  float offense_midfield_focus = 0.0f;
+  float defense_midfield_focus = 0.0f;
+  float offense_midfield_focus_strength = 0.0f;
+  float defense_midfield_focus_strength = 0.0f;
+  float offense_side_focus_strength = 0.0f;
+  float defense_side_focus_strength = 0.0f;
+  float offense_micro_focus_strength = 0.0f;
+  float defense_micro_focus_strength = 0.0f;
+};
+
+struct TeamInfo {
+  TeamTacticsInfo tactics;
+  float possession_amount = 0.0f;
+  float fading_possession_amount = 0.0f;
+  float offside_trap_x = 0.0f;
+  int designated_possession_player = -1;
+  int time_to_ball_ms = 0;
 };
 
 // Observable match state shared with model adapters.
 struct SharedInfo {
   Position ball_position;
-  Position ball_direction;
+  Position ball_velocity;
   Position ball_rotation;
   std::vector<PlayerInfo> left_team;
   std::vector<PlayerInfo> right_team;
+  TeamInfo teams[2];
   int left_goals, right_goals;
   e_GameMode game_mode;
   bool is_in_play = false;
-  int ball_owned_team = 0;
-  int ball_owned_player = 0;
+  int set_piece_team = -1;
+  int set_piece_taker = -1;
+  int ball_owned_team = -1;
+  int ball_owned_player = -1;
+  int last_touch_team = -1;
+  int last_touch_player = -1;
+  int match_time_ms = 0;
   int step = 0;
 };
 

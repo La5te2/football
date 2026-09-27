@@ -34,20 +34,20 @@ PyObject* PlayerToPython(const TrainingPlayer& player) {
   PyObject* result = PyDict_New();
   if (!result) return nullptr;
   PyObject* position = PositionToPython(player.position);
-  PyObject* direction = PositionToPython(player.direction);
+  PyObject* velocity = PositionToPython(player.velocity);
   PyObject* tired = PyFloat_FromDouble(player.tired_factor);
   PyObject* role = PyLong_FromLong(player.role);
   PyObject* card = PyBool_FromLong(player.has_card);
   PyObject* active = PyBool_FromLong(player.is_active);
-  if (!position || !direction || !tired || !role || !card || !active ||
+  if (!position || !velocity || !tired || !role || !card || !active ||
       PyDict_SetItemString(result, "position", position) < 0 ||
-      PyDict_SetItemString(result, "direction", direction) < 0 ||
+      PyDict_SetItemString(result, "velocity", velocity) < 0 ||
       PyDict_SetItemString(result, "tired_factor", tired) < 0 ||
       PyDict_SetItemString(result, "role", role) < 0 ||
       PyDict_SetItemString(result, "has_card", card) < 0 ||
       PyDict_SetItemString(result, "is_active", active) < 0) {
     Py_XDECREF(position);
-    Py_XDECREF(direction);
+    Py_XDECREF(velocity);
     Py_XDECREF(tired);
     Py_XDECREF(role);
     Py_XDECREF(card);
@@ -56,7 +56,7 @@ PyObject* PlayerToPython(const TrainingPlayer& player) {
     return nullptr;
   }
   Py_DECREF(position);
-  Py_DECREF(direction);
+  Py_DECREF(velocity);
   Py_DECREF(tired);
   Py_DECREF(role);
   Py_DECREF(card);
@@ -120,8 +120,8 @@ PyObject* ObservationToPython(const TrainingObservation& observation) {
   const bool success =
       SetItem(result, "ball_position",
               PositionToPython(observation.ball_position)) &&
-      SetItem(result, "ball_direction",
-              PositionToPython(observation.ball_direction)) &&
+      SetItem(result, "ball_velocity",
+              PositionToPython(observation.ball_velocity)) &&
       SetItem(result, "ball_rotation",
               PositionToPython(observation.ball_rotation)) &&
       SetItem(result, "teams", teams) &&

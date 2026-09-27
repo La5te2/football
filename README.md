@@ -45,8 +45,6 @@ Use `--left` and `--right` to assign either `builtin` or a model plugin before t
 
 Use `--games <positive-integer>` to run several matches from the same initial state before the executable exits:
 
-Each match keeps the same physical initial state and uses a distinct random seed. Replay files store every match's seed and serialized initial state for exact playback.
-
 ```powershell
 .\bin\gfootball.exe --games 10 --render=false --real_time=false
 ```
@@ -56,17 +54,13 @@ In a rendered match, press Space to pause or resume. Use `[` and `]` to select 0
 The same controller options apply to headless matches:
 
 ```powershell
-.\bin\gfootball.exe --render=false --real_time=false `
-  --left external-model.dll `
-  --right external-model.dll
+.\bin\gfootball.exe --render=false --real_time=false --left external-model.dll --right external-model.dll
 ```
 
 Add `--record <file>` to save the requested matches in one replay file. The option is inactive unless it is specified:
 
 ```powershell
-.\bin\gfootball.exe --games 10 --record matches.gfr `
-  --left external-model.dll `
-  --right builtin
+.\bin\gfootball.exe --games 10 --record matches.gfr --left external-model.dll --right builtin
 ```
 
 Replay files are rendered by the separate replay executable:

@@ -32,57 +32,40 @@ void SetDefaultEnvironment(const char* name, const std::string& value) {
   if (!std::getenv(name)) SetEnvironment(name, value);
 }
 
-void ShowError(const std::string& message) {
+void ShowError(const std::string& message, bool dialog) {
 #ifdef _WIN32
-  MessageBoxA(nullptr, message.c_str(), "gfootball replay",
-              MB_OK | MB_ICONERROR);
-#else
-  std::cerr << message << '\n';
-#endif
-}
-
-void AddFormation(std::vector<FormationEntry>& team, bool kickoff_team) {
-  struct Entry {
-    float x;
-    float y;
-    e_PlayerRole role;
-  };
-  static constexpr Entry formation[] = {
-      {-1.0f, 0.0f, e_PlayerRole_GK},
-      {0.0f, 0.02f, e_PlayerRole_RM},
-      {0.0f, -0.02f, e_PlayerRole_CF},
-      {-0.422f, -0.19576f, e_PlayerRole_LB},
-      {-0.5f, -0.06356f, e_PlayerRole_CB},
-      {-0.5f, 0.063559f, e_PlayerRole_CB},
-      {-0.422f, 0.19576f, e_PlayerRole_RB},
-      {-0.184212f, -0.10568f, e_PlayerRole_CM},
-      {-0.267574f, 0.0f, e_PlayerRole_CM},
-      {-0.184212f, 0.10568f, e_PlayerRole_CM},
-      {-0.01f, -0.2161f, e_PlayerRole_LM},
-  };
-  for (int i = 0; i < 11; ++i) {
-    float x = formation[i].x;
-    float y = formation[i].y;
-    if (!kickoff_team && i == 1) {
-      x = -0.05f;
-      y = 0.0f;
-    } else if (!kickoff_team && i == 2) {
-      x = -0.01f;
-      y = 0.216102f;
-    }
-    team.emplace_back(x, y, formation[i].role, false, true);
+  if (dialog) {
+    MessageBoxA(nullptr, message.c_str(), "gfootball replay",
+                MB_OK | MB_ICONERROR);
+    return;
   }
+#endif
+  std::cerr << message << '\n';
 }
 
-boost::shared_ptr<ScenarioConfig> MakeScenario(
-    int left_agents, int right_agents, bool real_time) {
-  auto config = ScenarioConfig::make();
-  config->left_agents = left_agents;
-  config->right_agents = right_agents;
-  config->real_time = real_time;
-  AddFormation(config->left_team, true);
-  AddFormation(config->right_team, false);
-  return config;
+// Reads the scenario already stored in an engine state so the replay
+// environment can be constructed before that state is restored.
+boost::shared_ptr<ScenarioConfig> ReadScenario(
+    GameEnv& env, const std::string& state) {
+  EnvState reader(&env, state);
+  std::string pickle;
+  reader.process(pickle);
+  GameState game_state = game_created;
+  reader.process(game_state);
+  char random_state_byte = 0;
+  for (std::size_t index = 0; index < sizeof(env.context->rng); ++index) {
+    reader.process(random_state_byte);
+  }
+  auto recorded_config = ScenarioConfig::make();
+  recorded_config->ProcessStateConstant(&reader);
+  recorded_config->ProcessState(&reader);
+  if (recorded_config->left_agents < 0 ||
+      recorded_config->left_agents > kGFootballPlayersPerTeam ||
+      recorded_config->right_agents < 0 ||
+      recorded_config->right_agents > kGFootballPlayersPerTeam) {
+    throw std::runtime_error("Replay contains invalid controller counts");
+  }
+  return recorded_config;
 }
 
 }  // namespace
@@ -101,12 +84,12 @@ int main(int argc, char** argv) {
                replay_path.empty()) {
       replay_path = argument;
     } else {
-      ShowError("Unknown option: " + argument);
+      ShowError("Unknown option: " + argument, render);
       return 2;
     }
   }
   if (replay_path.empty()) {
-    ShowError("Usage: replay.exe <replay-file>");
+    ShowError("Usage: replay.exe <replay-file>", render);
     return 2;
   }
 
@@ -121,17 +104,18 @@ int main(int argc, char** argv) {
 
   try {
     ReplayReader replay(replay_path);
-    const int left_agents = replay.external_team(0) ? 1 : 0;
-    const int right_agents = replay.external_team(1) ? 1 : 0;
 
     auto env = std::make_unique<GameEnv>();
     env->game_config.render = render;
     env->game_config.physics_steps_per_frame = 10;
     env->start_game();
-    auto config = MakeScenario(left_agents, right_agents, real_time);
+    auto config = ReadScenario(*env, replay.game(0).initial_state);
+    config->real_time = real_time;
     env->state = game_running;
     if (render) env->game_config.render_frames_per_step = 6;
     env->reset(*config, false);
+    env->scenario_config =
+        *ReadScenario(*env, replay.game(0).initial_state);
 
     for (std::size_t game_index = 0;
          game_index < replay.game_count() && !env->window_closed();
@@ -139,6 +123,7 @@ int main(int argc, char** argv) {
       const ReplayGame& game = replay.game(game_index);
       {
         ContextHolder context(env.get());
+        env->set_random_seed(game.seed);
         env->set_state(game.initial_state);
         if (env->scenario_config.game_engine_random_seed != game.seed) {
           throw std::runtime_error(
@@ -172,7 +157,7 @@ int main(int argc, char** argv) {
       }
     }
   } catch (const std::exception& error) {
-    ShowError(error.what());
+    ShowError(error.what(), render);
     return 1;
   }
   return 0;

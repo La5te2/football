@@ -298,19 +298,8 @@ void PlayerController::_KeeperDeflectCommand(PlayerCommandQueue &commandQueue,
                                              bool onlyPickupAnims) {
   DO_VALIDATION;
 
-  if (CastPlayer()->GetFormationEntry().role != e_PlayerRole_GK) return;
   if (match->GetBall()->Predict(400).GetDistance(player->GetPosition()) > ballDistanceOptimizeThreshold + 10.0f) return;
-
-  // can't use hands if teammate intentionally kicked ball to us
-  if (match->GetLastTouchTeamID() == team->GetID() && match->GetLastTouchPlayer() != CastPlayer() && match->GetLastTouchTeamID(e_TouchType_Intentional_Kicked) == team->GetID()) return;
-
-  if (match->GetBallRetainer() != 0) return;
-
-  // can't use hands outside of keeper's 16 yard box (todo: make precise, probably in humanoid.cpp's getbestcheatableanim)
-  if (fabs(match->GetBall()->Predict(160).coords[1]) > 20.05f) return;
-  if (match->GetBall()->Predict(160).coords[0] * -team->GetDynamicSide() >
-      -pitchHalfW + 16.4)
-    return;
+  if (!match->CanGoalkeeperUseHands(CastPlayer())) return;
 
   PlayerCommand command;
   command.desiredFunctionType = e_FunctionType_Deflect;

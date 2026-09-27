@@ -219,7 +219,7 @@ namespace blunted {
       virtual ~Renderer3D() { DO_VALIDATION;};
       virtual void SetContext() = 0;
       virtual void DisableContext() = 0;
-      virtual const screenshoot& GetScreen() = 0;
+      virtual const Screenshot& GetScreen() = 0;
 
       virtual void SwapBuffers() = 0;
 
@@ -321,7 +321,7 @@ namespace blunted {
     }
     virtual void SetContext() {}
     virtual void DisableContext() {}
-    virtual const screenshoot& GetScreen() { DO_VALIDATION; return screen_; }
+    virtual const Screenshot& GetScreen() { DO_VALIDATION; return screen_; }
     virtual ~MockRenderer3D() { DO_VALIDATION;};
 
     virtual void SwapBuffers() { DO_VALIDATION;};
@@ -413,7 +413,7 @@ namespace blunted {
 
     protected:
       View view_;
-      screenshoot screen_;
+      Screenshot screen_;
   };
 
 

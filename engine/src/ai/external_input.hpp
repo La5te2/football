@@ -40,7 +40,6 @@ class ExternalInput {
     bool GetButton(e_ButtonFunction buttonFunction);
     void ResetNotSticky();
     void SetButton(e_ButtonFunction buttonFunction, bool state);
-    bool GetPreviousButtonState(e_ButtonFunction buttonFunction);
     blunted::Vector3 GetDirection();
     blunted::Vector3 GetOriginalDirection();
 

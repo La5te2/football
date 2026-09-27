@@ -271,7 +271,7 @@ struct FormationEntry {
         position == f.position &&
         controllable == f.controllable;
   }
-  Vector3 position_env() { DO_VALIDATION;
+  Vector3 position_env() const { DO_VALIDATION;
     return Vector3(position.coords[0],
                    position.coords[1] / FORMATION_Y_SCALE,
                    position.coords[2]);

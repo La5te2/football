@@ -112,12 +112,10 @@ void LoadModels(GameEnv& env, const std::string& left,
                 const std::string& right,
                 const std::filesystem::path& root) {
   if (!IsBuiltin(left)) {
-    env.load_model(ResolvePlugin(left, root), true, 0,
-                   kMatchDurationSteps);
+    env.load_model(ResolvePlugin(left, root), true, kMatchDurationSteps);
   }
   if (!IsBuiltin(right)) {
-    env.load_model(ResolvePlugin(right, root), false, 0,
-                   kMatchDurationSteps);
+    env.load_model(ResolvePlugin(right, root), false, kMatchDurationSteps);
   }
 }
 
@@ -178,8 +176,10 @@ int main(int argc, char** argv) {
   SetDefaultEnvironment("MESA_GLSL_VERSION_OVERRIDE", "150");
 
   try {
-    const int left_agents = IsBuiltin(left) ? 0 : 1;
-    const int right_agents = IsBuiltin(right) ? 0 : 1;
+    const int left_agents =
+        IsBuiltin(left) ? 0 : kGFootballPlayersPerTeam;
+    const int right_agents =
+        IsBuiltin(right) ? 0 : kGFootballPlayersPerTeam;
     auto simulation = std::make_unique<GameEnv>();
     simulation->game_config.physics_steps_per_frame = 10;
     simulation->start_game();
@@ -227,8 +227,7 @@ int main(int argc, char** argv) {
     LoadModels(*env, left, right, root);
     const std::string initial_state = env->get_state("");
     if (!record_path.empty()) {
-      env->start_recording(record_path, !IsBuiltin(left), !IsBuiltin(right),
-                           kMatchDurationSteps);
+      env->start_recording(record_path);
     }
     std::random_device entropy;
     std::seed_seq seed_material{

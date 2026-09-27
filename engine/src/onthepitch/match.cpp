@@ -768,12 +768,35 @@ void Match::GetTeamState(SharedInfo *state, int team_id) {
       }
       PlayerInfo info;
       info.player_position = position.coords;
-      info.player_direction =
+      info.player_velocity =
           (movement / GetGameConfig().physics_steps_per_frame).coords;
+      Vector3 facing = player->GetDirectionVec();
+      if (team_id == 1) facing.Mirror();
+      info.player_facing =
+          Position(facing.coords[0], facing.coords[1], facing.coords[2], true);
+      const FormationEntry formation = player->GetFormationEntry();
+      const FormationEntry dynamic_formation =
+          player->GetDynamicFormationEntry();
+      const Vector3 formation_position = formation.position_env();
+      const Vector3 dynamic_formation_position =
+          dynamic_formation.position_env();
+      info.formation_position =
+          Position(formation_position.coords[0], formation_position.coords[1],
+                   0.0f, true);
+      info.dynamic_formation_position = Position(
+          dynamic_formation_position.coords[0],
+          dynamic_formation_position.coords[1], 0.0f, true);
       info.tired_factor = 1 - player->GetFatigueFactorInv();
       info.has_card = player->HasCards();
       info.is_active = player->IsActive();
-      info.role = player->GetFormationEntry().role;
+      info.touch_pending = player->TouchPending();
+      info.role = formation.role;
+      info.dynamic_role = dynamic_formation.role;
+      info.function_type = player->GetCurrentFunctionType();
+      info.action_frame = player->GetCurrentFrame();
+      info.touch_frame = player->GetTouchFrame();
+      info.possession_duration_ms = player->GetPossessionDuration_ms();
+      info.time_to_ball_ms = player->GetTimeNeededToGetToBall_ms();
       if (player->HasPossession() && GetLastTouchTeamID() != -1 &&
           GetLastTouchTeam()->GetLastTouchPlayer() == player) {
         DO_VALIDATION;
@@ -790,7 +813,7 @@ void Match::GetState(SharedInfo *state) {
   state->ball_position = ball->GetAveragePosition(5).coords;
   state->ball_rotation =
       (ball->GetRotation() / GetGameConfig().physics_steps_per_frame).coords;
-  state->ball_direction =
+  state->ball_velocity =
       (ball->GetMovement() / GetGameConfig().physics_steps_per_frame).coords;
   state->ball_owned_player = -1;
   state->ball_owned_team = -1;
@@ -803,6 +826,59 @@ void Match::GetState(SharedInfo *state) {
   state->game_mode = IsInSetPiece() ? referee->GetBuffer().desiredSetPiece : e_GameMode_Normal;
   GetTeamState(state, first_team);
   GetTeamState(state, second_team);
+  state->match_time_ms = static_cast<int>(GetMatchTime_ms());
+  state->last_touch_team = GetLastTouchTeamID();
+
+  const RefereeBuffer &set_piece = referee->GetBuffer();
+  state->set_piece_team =
+      IsInSetPiece() && set_piece.setpiece_team
+          ? set_piece.setpiece_team->GetID()
+          : -1;
+
+  for (int team_id = 0; team_id < 2; ++team_id) {
+    Team *team = teams[team_id];
+    TeamInfo &team_info = state->teams[team_id];
+    team_info.tactics = team->GetController()->GetLiveTactics();
+    team_info.possession_amount = team->GetTeamPossessionAmount();
+    team_info.fading_possession_amount =
+        team->GetFadingTeamPossessionAmount();
+    team_info.offside_trap_x =
+        Position(team->GetController()->GetOffsideTrapX()).env_coord(0);
+    team_info.time_to_ball_ms = team->GetTimeNeededToGetToBall_ms();
+
+    const std::vector<Player *> &players = team->GetAllPlayers();
+    for (int player_index = 0;
+         player_index < static_cast<int>(players.size()); ++player_index) {
+      Player *player = players[player_index];
+      if (player == team->GetDesignatedTeamPossessionPlayer()) {
+        team_info.designated_possession_player = player_index;
+      }
+      if (team_id == state->last_touch_team &&
+          player == team->GetLastTouchPlayer()) {
+        state->last_touch_player = player_index;
+      }
+      if (team_id == state->set_piece_team && player == set_piece.taker) {
+        state->set_piece_taker = player_index;
+      }
+    }
+  }
+}
+
+bool Match::CanGoalkeeperUseHands(Player *player) {
+  if (player->GetFormationEntry().role != e_PlayerRole_GK ||
+      GetBallRetainer() != nullptr) {
+    return false;
+  }
+  if (GetLastTouchTeamID() == player->GetTeamID() &&
+      GetLastTouchPlayer() != player &&
+      GetLastTouchTeamID(e_TouchType_Intentional_Kicked) ==
+          player->GetTeamID()) {
+    return false;
+  }
+  const Vector3 predicted_ball = ball->Predict(160);
+  if (fabs(predicted_ball.coords[1]) > 20.05f) return false;
+  return predicted_ball.coords[0] * -player->GetTeam()->GetDynamicSide() <=
+         -pitchHalfW + 16.4f;
 }
 
 // THE SPICE

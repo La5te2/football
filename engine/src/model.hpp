@@ -14,8 +14,7 @@ struct SharedInfo;
 // Engine-private owner and dispatcher for one external model DLL.
 class Model final {
  public:
-  Model(const std::filesystem::path& path, bool left_team,
-        int controller, int game_duration);
+  Model(const std::filesystem::path& path, bool left_team, int game_duration);
   ~Model();
   Model(const Model&) = delete;
   Model& operator=(const Model&) = delete;
@@ -30,7 +29,6 @@ class Model final {
   GFootballModelReset reset_ = nullptr;
   GFootballModelDecide decide_ = nullptr;
   bool left_team_ = false;
-  int controller_ = 0;
 };
 
 #endif

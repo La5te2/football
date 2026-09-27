@@ -1277,6 +1277,26 @@ void TeamAIController::UpdateTactics() {
     }
     iter++;
   }
+
+}
+
+TeamTacticsInfo TeamAIController::GetLiveTactics() const {
+  TeamTacticsInfo tactics;
+  tactics.offense_depth_factor = liveTeamTactics.GetReal("position_offense_depth_factor");
+  tactics.defense_depth_factor = liveTeamTactics.GetReal("position_defense_depth_factor");
+  tactics.offense_width_factor = liveTeamTactics.GetReal("position_offense_width_factor");
+  tactics.defense_width_factor = liveTeamTactics.GetReal("position_defense_width_factor");
+  tactics.offense_own_half_factor = liveTeamTactics.GetReal("position_offense_ownhalf_factor");
+  tactics.defense_own_half_factor = liveTeamTactics.GetReal("position_defense_ownhalf_factor");
+  tactics.offense_midfield_focus = liveTeamTactics.GetReal("position_offense_midfieldfocus");
+  tactics.defense_midfield_focus = liveTeamTactics.GetReal("position_defense_midfieldfocus");
+  tactics.offense_midfield_focus_strength = liveTeamTactics.GetReal("position_offense_midfieldfocus_strength");
+  tactics.defense_midfield_focus_strength = liveTeamTactics.GetReal("position_defense_midfieldfocus_strength");
+  tactics.offense_side_focus_strength = liveTeamTactics.GetReal("position_offense_sidefocus_strength");
+  tactics.defense_side_focus_strength = liveTeamTactics.GetReal("position_defense_sidefocus_strength");
+  tactics.offense_micro_focus_strength = liveTeamTactics.GetReal("position_offense_microfocus_strength");
+  tactics.defense_micro_focus_strength = liveTeamTactics.GetReal("position_defense_microfocus_strength");
+  return tactics;
 }
 
 void TeamAIController::Reset() {

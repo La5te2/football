@@ -136,7 +136,7 @@ SharedInfo GameEnv::get_info() {
   return info;
 }
 
-screenshoot GameEnv::get_frame() {
+Screenshot GameEnv::get_frame() {
   SetGame(this);
   return GetGraphicsSystem()->GetScreen();
 }
@@ -230,21 +230,31 @@ bool GameEnv::set_controlled_player(bool left_team, int controller,
   return team->SetExternalControllerPlayer(controller, player);
 }
 
-void GameEnv::load_model(const std::filesystem::path& path, bool left_team,
-                         int controller, int game_duration) {
-  models_.push_back(
-      std::make_unique<Model>(path, left_team, controller, game_duration));
+void GameEnv::apply_model_decision(
+    bool left_team, const GFootballModelDecision& decision) {
+  for (int player = 0; player < kGFootballPlayersPerTeam; ++player) {
+    const int player_action = decision.actions[player];
+    if (player_action == game_delegate) {
+      action(game_delegate, left_team, player);
+      continue;
+    }
+    if (!set_controlled_player(left_team, player, player)) {
+      throw std::runtime_error("Unable to assign model action recipient");
+    }
+    action(player_action, left_team, player);
+  }
 }
 
-void GameEnv::start_recording(const std::filesystem::path& path,
-                              bool left_external, bool right_external,
-                              int match_duration) {
+void GameEnv::load_model(const std::filesystem::path& path, bool left_team,
+                         int game_duration) {
+  models_.push_back(std::make_unique<Model>(path, left_team, game_duration));
+}
+
+void GameEnv::start_recording(const std::filesystem::path& path) {
   if (replay_game_) {
     throw std::runtime_error("Cannot record while replaying a match");
   }
-  replay_writer_ = std::make_unique<ReplayWriter>(
-      path, std::array<std::uint8_t, 2>{left_external, right_external},
-      match_duration);
+  replay_writer_ = std::make_unique<ReplayWriter>(path);
 }
 
 void GameEnv::begin_recording_game(std::uint32_t seed,
@@ -287,19 +297,12 @@ void GameEnv::set_random_seed(std::uint32_t seed) {
 }
 
 void GameEnv::record_model_decision(
-    bool left_team, const GFootballModelObservation& observation,
-    const GFootballModelDecision& decision) {
+    bool left_team, const GFootballModelDecision& decision) {
   if (!replay_writer_) return;
   if (!recording_step_active_) {
     throw std::runtime_error("Model decision occurred outside a replay step");
   }
   const int side = left_team ? 0 : 1;
-  if (recording_step_.has_decision[side]) {
-    throw std::runtime_error("Replay supports one model controller per team");
-  }
-  recording_step_.has_observation[side] = 1;
-  recording_step_.observations[side] = observation;
-  recording_step_.has_decision[side] = 1;
   recording_step_.decisions[side] = decision;
 }
 
@@ -405,7 +408,7 @@ void GameEnv::action(int action, bool left_team, int player) {
     case game_release_dribble:
       input->SetButton(e_ButtonFunction_Dribble, false);
       break;
-    case game_builtin_ai:
+    case game_delegate:
       input->SetDisabled(true);
       break;
   }
@@ -414,8 +417,8 @@ void GameEnv::action(int action, bool left_team, int player) {
 std::string GameEnv::get_state(const std::string& pickle) {
   ContextHolder c(this);
   EnvState reader(this, "");
-  string mutable_picke = pickle;
-  reader.process(mutable_picke);
+  string mutable_pickle = pickle;
+  reader.process(mutable_pickle);
   ProcessState(&reader);
   return reader.GetState();
 }
@@ -449,20 +452,17 @@ void GameEnv::step() {
         throw std::runtime_error("Replay step does not match the engine state");
       }
       for (int side = 0; side < 2; ++side) {
-        if (!replay_step.has_decision[side]) continue;
         const GFootballModelDecision& decision = replay_step.decisions[side];
-        if (decision.controlled_player < 0 ||
-            decision.controlled_player >= kGFootballPlayersPerTeam ||
-            decision.action < game_idle || decision.action > game_builtin_ai) {
-          throw std::runtime_error("Replay contains an invalid model decision");
-        }
         const bool left_team = side == 0;
-        set_controlled_player(left_team, 0, decision.controlled_player);
-        action(decision.action, left_team, 0);
+        apply_model_decision(left_team, decision);
       }
     } else if (replay_writer_) {
       recording_step_ = ReplayStep{};
       recording_step_.step = model_state.step;
+      for (auto& decision : recording_step_.decisions) {
+        std::fill(std::begin(decision.actions), std::end(decision.actions),
+                  game_delegate);
+      }
       recording_step_active_ = true;
       try {
         for (auto& model : models_) {

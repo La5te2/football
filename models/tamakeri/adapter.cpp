@@ -32,48 +32,18 @@ enum EngineAction {
   kReleaseDirection = 20,
   kReleaseSprint = 30,
   kReleaseDribble = 31,
+  kDelegate = 32,
 };
 
 constexpr int kPolicyActionCount = 52;
 constexpr int kBuiltinAiPolicyAction = 19;
+constexpr int kUnusedPolicyAction = 51;
 constexpr int kDirectedKickBegin = 20;
 
 float Distance(float ax, float ay, float bx, float by) {
   const float dx = ax - bx;
   const float dy = ay - by;
   return std::sqrt(dx * dx + dy * dy);
-}
-
-float DistanceMeters(float ax, float ay, float bx, float by) {
-  constexpr float kHalfPitchLength = 54.4f;
-  constexpr float kHalfPitchWidth = 83.6f;
-  return Distance((ax - bx) * kHalfPitchLength,
-                  (ay - by) * kHalfPitchWidth, 0.0f, 0.0f);
-}
-
-// Approximates arrival time from public motion state for TamakEri's local player
-// selection without using an engine-provided tactical value.
-int EstimateInterceptionTime(const GFootballModelPlayer& player,
-                             const GFootballModelObservation& state) {
-  constexpr float kReachPerStep = 0.8f;
-  for (int step = 0; step <= 30; ++step) {
-    const float ball_x =
-        state.ball_position[0] + state.ball_direction[0] * step;
-    const float ball_y =
-        state.ball_position[1] + state.ball_direction[1] * step;
-    const int momentum_steps = std::min(step, 3);
-    const float player_x =
-        player.position[0] + player.direction[0] * momentum_steps;
-    const float player_y =
-        player.position[1] + player.direction[1] * momentum_steps;
-    if (DistanceMeters(player_x, player_y, ball_x, ball_y) <=
-        0.5f + kReachPerStep * step) {
-      return step * 100;
-    }
-  }
-  return 3000 + static_cast<int>(100 * DistanceMeters(
-      player.position[0], player.position[1], state.ball_position[0],
-      state.ball_position[1]));
 }
 
 float MultiScale(float value, float scale) {
@@ -123,79 +93,25 @@ TamakEriAdapter::TamakEriAdapter(const std::string& model_path, int side,
   Reset();
 }
 
-// Clears player selection, delayed actions, and policy history for a new match.
+// Clears delayed actions and policy history for a new match.
 void TamakEriAdapter::Reset() {
-  selected_player_ = -1;
   pending_action_ = -1;
   last_action_ = 0;
   action_history_.clear();
 }
 
-// Reconstructs TamakEri's engine-like possession selector locally from public
-// player and ball state.
-void TamakEriAdapter::SelectPlayer(
-    const GFootballModelObservation& observation) {
-  const auto& team = observation.teams[side_];
-  int candidate = -1;
-  if (observation.ball_owned_team == side_ &&
-      observation.ball_owned_player > 0 &&
-      observation.ball_owned_player < kGFootballPlayersPerTeam &&
-      team[observation.ball_owned_player].is_active) {
-    candidate = observation.ball_owned_player;
-  }
-
-  int candidate_time = std::numeric_limits<int>::max();
-  if (candidate < 0) {
-    for (int i = 0; i < kGFootballPlayersPerTeam; ++i) {
-      if (!team[i].is_active || team[i].role == 0) continue;
-      const int time = EstimateInterceptionTime(team[i], observation);
-      if (time < candidate_time) {
-        candidate_time = time;
-        candidate = i;
-      }
-    }
-  } else {
-    candidate_time = EstimateInterceptionTime(team[candidate], observation);
-  }
-
-  if (candidate < 0) {
-    for (int i = 0; i < kGFootballPlayersPerTeam; ++i) {
-      if (team[i].is_active) {
-        candidate = i;
-        candidate_time = EstimateInterceptionTime(team[i], observation);
-        break;
-      }
-    }
-  }
-
-  if (selected_player_ < 0 || selected_player_ >= kGFootballPlayersPerTeam ||
-      !team[selected_player_].is_active) {
-    selected_player_ = candidate;
-  } else if (candidate >= 0 && candidate != selected_player_) {
-    const int selected_time =
-        EstimateInterceptionTime(team[selected_player_], observation);
-    const bool candidate_has_ball =
-        observation.ball_owned_team == side_ &&
-        observation.ball_owned_player == candidate;
-    if (candidate_has_ball || observation.game_mode != 0 ||
-        3 * candidate_time < selected_time) {
-      selected_player_ = candidate;
-    }
-  }
-}
-
 // Canonicalizes either physical side into TamakEri's own-team-attacks-right
 // coordinate system and reproduces the compact observation used in training.
 TamakEriAdapter::Observation TamakEriAdapter::Convert(
-    const GFootballModelObservation& state) const {
+    const GFootballModelObservation& state, int controlled_player) const {
   Observation result;
   const auto& own = state.teams[side_];
   const auto& opponent = state.teams[1 - side_];
   const float rotation = side_ == 0 ? 1.0f : -1.0f;
   result.ball = {
       rotation * state.ball_position[0], rotation * state.ball_position[1],
-      state.ball_position[2], rotation * state.ball_direction[0],
-      rotation * state.ball_direction[1], state.ball_direction[2],
+      state.ball_position[2], rotation * state.ball_velocity[0],
+      rotation * state.ball_velocity[1], state.ball_velocity[2],
       state.ball_rotation[0], state.ball_rotation[1], state.ball_rotation[2]};
   for (int i = 0; i < 11; ++i) {
     result.own_position[i] = {
@@ -204,10 +120,10 @@ TamakEriAdapter::Observation TamakEriAdapter::Convert(
         rotation * opponent[i].position[0],
         rotation * opponent[i].position[1]};
     result.own_direction[i] = {
-        rotation * own[i].direction[0], rotation * own[i].direction[1]};
+        rotation * own[i].velocity[0], rotation * own[i].velocity[1]};
     result.opponent_direction[i] = {
-        rotation * opponent[i].direction[0],
-        rotation * opponent[i].direction[1]};
+        rotation * opponent[i].velocity[0],
+        rotation * opponent[i].velocity[1]};
     result.own_tired[i] = own[i].tired_factor;
     result.opponent_tired[i] = opponent[i].tired_factor;
     result.own_card[i] = own[i].has_card ? 1.0f : 0.0f;
@@ -217,14 +133,15 @@ TamakEriAdapter::Observation TamakEriAdapter::Convert(
   }
   for (int direction = 1; direction <= 8; ++direction) {
     const int actual = side_ == 0 ? direction : OppositeDirection(direction);
-    result.sticky[direction - 1] = state.sticky_actions[actual - 1] ? 1 : 0;
+    result.sticky[direction - 1] =
+        state.sticky_actions[controlled_player][actual - 1] ? 1 : 0;
   }
-  result.sticky[8] = state.sticky_actions[8] ? 1 : 0;
-  result.sticky[9] = state.sticky_actions[9] ? 1 : 0;
+  result.sticky[8] = state.sticky_actions[controlled_player][8] ? 1 : 0;
+  result.sticky[9] = state.sticky_actions[controlled_player][9] ? 1 : 0;
   result.score = side_ == 0
       ? std::array<int, 2>{state.goals[0], state.goals[1]}
       : std::array<int, 2>{state.goals[1], state.goals[0]};
-  result.controlled_player = selected_player_;
+  result.controlled_player = controlled_player;
   result.ball_owned_team = state.ball_owned_team < 0
       ? -1
       : (side_ == 0 ? state.ball_owned_team : 1 - state.ball_owned_team);
@@ -407,10 +324,10 @@ int TamakEriAdapter::ChooseAction(const Observation& observation,
   const auto values = logits.contiguous().view({-1});
   const auto accessor = values.accessor<float, 1>();
   for (int action = 0; action < kPolicyActionCount; ++action) {
-    // Policy index 19 is game_builtin_ai. TamakEri excludes it so the external
-    // model remains the sole controller of its selected player instead of
-    // sharing control with ElizaController. Player selection is independent.
-    bool legal = action != kBuiltinAiPolicyAction;
+    // TamakEri excludes policy index 19 and its original legal-action range
+    // stops at index 50 even though the network emits 52 logits.
+    bool legal = action != kBuiltinAiPolicyAction &&
+                 action != kUnusedPolicyAction;
     const bool owns_ball = observation.ball_owned_team == 0;
     if (!owns_ball && ((action >= 9 && action <= 12) || action == 17 ||
                        action >= kDirectedKickBegin)) legal = false;
@@ -441,20 +358,35 @@ int TamakEriAdapter::Submit(int action) {
   return backend;
 }
 
-// Chooses the recipient, updates policy history, runs one inference, and splits
-// directed kicks into a kick followed by a direction.
+// Maps the engine-designated recipient into the common action array, updates
+// policy history, runs inference, and splits directed kicks across two steps.
 GFootballModelDecision TamakEriAdapter::Decide(
     const GFootballModelObservation& state) {
-  SelectPlayer(state);
-  if (selected_player_ < 0) return {-1, kIdle};
+  const int designated_player =
+      state.team_state[side_].designated_possession_player;
+  const int controlled_player =
+      designated_player >= 0 && designated_player < kGFootballPlayersPerTeam &&
+              state.teams[side_][designated_player].is_active
+          ? designated_player
+          : -1;
+  auto decision = [this, controlled_player](int action) {
+    GFootballModelDecision result{};
+    std::fill(std::begin(result.actions), std::end(result.actions),
+              kDelegate);
+    if (controlled_player >= 0) {
+      result.actions[controlled_player] = Submit(action);
+    }
+    return result;
+  };
+  if (controlled_player < 0) return decision(kIdle);
   action_history_.push_back(last_action_);
   while (action_history_.size() > 8) action_history_.pop_front();
   if (pending_action_ >= 0) {
     const int pending = pending_action_;
     pending_action_ = -1;
-    return {selected_player_, Submit(pending)};
+    return decision(pending);
   }
-  const Observation observation = Convert(state);
+  const Observation observation = Convert(state, controlled_player);
   torch::InferenceMode inference_mode;
   const at::Tensor logits = model_.forward(Features(observation)).toTensor();
   const int action = ChooseAction(observation, logits);
@@ -462,7 +394,7 @@ GFootballModelDecision TamakEriAdapter::Decide(
     const int offset = action - kDirectedKickBegin;
     const int kick = offset / 8;
     pending_action_ = offset % 8 + 1;
-    return {selected_player_, Submit(9 + kick)};
+    return decision(9 + kick);
   }
-  return {selected_player_, Submit(action)};
+  return decision(action);
 }

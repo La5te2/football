@@ -24,13 +24,25 @@ if errorlevel 1 exit /b 1
 cmake --build "%BUILD_DIR%" --parallel --config %BUILD_CONFIGURATION%
 if errorlevel 1 exit /b 1
 
-if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
+if exist "%RUNTIME_DIR%" cmake -E remove_directory "%RUNTIME_DIR%"
+if errorlevel 1 exit /b 1
+mkdir "%RUNTIME_DIR%"
+if errorlevel 1 exit /b 1
 copy /Y "%BUILD_DIR%\runtime\gfootball.exe" "%RUNTIME_DIR%\" >nul
+if errorlevel 1 exit /b 1
 copy /Y "%BUILD_DIR%\runtime\replay.exe" "%RUNTIME_DIR%\" >nul
+if errorlevel 1 exit /b 1
 for %%F in ("%BUILD_DIR%\runtime\*.dll") do (
-  if /I not "%%~nxF"=="tamakeri.dll" copy /Y "%%~fF" "%RUNTIME_DIR%\" >nul
+  copy /Y "%%~fF" "%RUNTIME_DIR%\" >nul
+  if errorlevel 1 exit /b 1
+)
+if exist "%BUILD_DIR%\runtime\models" (
+  xcopy /E /I /Y "%BUILD_DIR%\runtime\models" "%RUNTIME_DIR%\models" >nul
+  if errorlevel 1 exit /b 1
 )
 xcopy /E /I /Y "%ROOT%engine\data" "%RUNTIME_DIR%\data" >nul
+if errorlevel 1 exit /b 1
 xcopy /E /I /Y "%ROOT%engine\fonts" "%RUNTIME_DIR%\fonts" >nul
+if errorlevel 1 exit /b 1
 
 echo Native runtime created in %RUNTIME_DIR%

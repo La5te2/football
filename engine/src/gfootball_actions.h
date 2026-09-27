@@ -47,7 +47,7 @@ enum Action {
   game_release_attacking_run = 29,
   game_release_sprint = 30,
   game_release_dribble = 31,
-  game_builtin_ai = 32
+  game_delegate = 32
 };
 
 #endif

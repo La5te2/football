@@ -18,7 +18,7 @@ constexpr int kTrainingActionCount = 32;
 
 struct TrainingPlayer {
   std::array<float, 3> position{};
-  std::array<float, 3> direction{};
+  std::array<float, 3> velocity{};
   float tired_factor = 0.0f;
   int role = 0;
   bool has_card = false;
@@ -28,7 +28,7 @@ struct TrainingPlayer {
 // Public match state copied into Python after each environment decision step.
 struct TrainingObservation {
   std::array<float, 3> ball_position{};
-  std::array<float, 3> ball_direction{};
+  std::array<float, 3> ball_velocity{};
   std::array<float, 3> ball_rotation{};
   std::array<std::array<TrainingPlayer, kTrainingPlayersPerTeam>, 2> teams{};
   std::array<int, 2> goals{};

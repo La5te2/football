@@ -17,12 +17,12 @@ def _one_hot(index: int, size: int) -> list[float]:
 def encode(observation: dict[str, Any], maximum_steps: int) -> torch.Tensor:
     values: list[float] = []
     values.extend(observation["ball_position"])
-    values.extend(observation["ball_direction"])
+    values.extend(observation["ball_velocity"])
     values.extend(observation["ball_rotation"])
     for team in observation["teams"]:
         for player in team:
             values.extend(player["position"])
-            values.extend(player["direction"])
+            values.extend(player["velocity"])
             values.append(player["tired_factor"])
             values.append(player["role"] / 9.0)
             values.append(float(player["has_card"]))

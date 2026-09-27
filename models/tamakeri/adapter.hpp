@@ -13,9 +13,8 @@
 
 #include "interface.hpp"
 
-// Implements every TamakEri-specific concern behind the model-neutral ABI:
-// local player selection, feature construction, policy decoding, and LibTorch
-// inference. It derives player selection only from public match observations.
+// Adapts the common model interface to TamakEri's tensor inputs, policy outputs,
+// action history, and LibTorch runtime.
 class TamakEriAdapter {
  public:
   TamakEriAdapter(const std::string& model_path, int side,
@@ -46,8 +45,8 @@ class TamakEriAdapter {
     int steps_left = 0;
   };
 
-  void SelectPlayer(const GFootballModelObservation& observation);
-  Observation Convert(const GFootballModelObservation& observation) const;
+  Observation Convert(const GFootballModelObservation& observation,
+                      int controlled_player) const;
   std::vector<torch::jit::IValue> Features(const Observation& observation) const;
   int ChooseAction(const Observation& observation,
                    const at::Tensor& logits) const;
@@ -56,7 +55,6 @@ class TamakEriAdapter {
   torch::jit::script::Module model_;
   int side_;
   int game_duration_;
-  int selected_player_ = -1;
   int pending_action_ = -1;
   int last_action_ = 0;
   std::deque<int> action_history_;

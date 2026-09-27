@@ -109,6 +109,7 @@ class Match {
     }
     float GetLastTouchBias(int decay_ms, unsigned long time_ms = 0) { DO_VALIDATION; if (GetLastTouchTeam()) return GetLastTouchTeam()->GetLastTouchBias(decay_ms, time_ms); else return 0; }
     bool IsBallInGoal() const { return ballIsInGoal; }
+    bool CanGoalkeeperUseHands(Player *player);
 
     Team* GetBestPossessionTeam();
 

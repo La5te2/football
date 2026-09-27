@@ -122,7 +122,7 @@ TrainingObservation TrainingEnvironment::Step(int controlled_player,
       controlled_player >= kTrainingPlayersPerTeam) {
     throw std::out_of_range("controlled_player must be in [0, 10]");
   }
-  if (action < game_idle || action >= game_builtin_ai) {
+  if (action < game_idle || action >= game_delegate) {
     throw std::out_of_range("action must be in [0, 31]");
   }
   {
@@ -142,7 +142,7 @@ TrainingObservation TrainingEnvironment::Observe() {
   const SharedInfo state = environment_->get_info();
   TrainingObservation observation;
   CopyPosition(state.ball_position, observation.ball_position);
-  CopyPosition(state.ball_direction, observation.ball_direction);
+  CopyPosition(state.ball_velocity, observation.ball_velocity);
   CopyPosition(state.ball_rotation, observation.ball_rotation);
   const std::vector<PlayerInfo>* teams[] = {&state.left_team,
                                             &state.right_team};
@@ -154,7 +154,7 @@ TrainingObservation TrainingEnvironment::Observe() {
       const PlayerInfo& source = teams[side]->at(player);
       TrainingPlayer& target = observation.teams[side][player];
       CopyPosition(source.player_position, target.position);
-      CopyPosition(source.player_direction, target.direction);
+      CopyPosition(source.player_velocity, target.velocity);
       target.tired_factor = source.tired_factor;
       target.role = source.role;
       target.has_card = source.has_card;

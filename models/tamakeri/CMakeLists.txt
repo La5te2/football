@@ -36,6 +36,21 @@ target_include_directories(tamakeri PRIVATE . ../../engine/src)
 target_include_directories(tamakeri SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS})
 target_link_libraries(tamakeri PRIVATE ${TORCH_LIBRARIES})
 
+set(TAMAKERI_RUNTIME_DIR "${CMAKE_BINARY_DIR}/runtime/models/tamakeri")
+set_target_properties(tamakeri PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${TAMAKERI_RUNTIME_DIR}"
+  LIBRARY_OUTPUT_DIRECTORY "${TAMAKERI_RUNTIME_DIR}")
+foreach(configuration DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+  set_target_properties(tamakeri PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY_${configuration} "${TAMAKERI_RUNTIME_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY_${configuration} "${TAMAKERI_RUNTIME_DIR}")
+endforeach()
+
+add_custom_command(TARGET tamakeri POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/tamakeri.pt"
+          "$<TARGET_FILE_DIR:tamakeri>")
+
 if(TORCH_CXX_FLAGS)
   separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
   target_compile_options(tamakeri PRIVATE ${TORCH_CXX_FLAGS_LIST})
@@ -48,10 +63,7 @@ if(WIN32)
        "${GFOOTBALL_TORCH_ROOT}/lib/*.dll")
   add_custom_command(TARGET tamakeri POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:tamakeri>
-            "${CMAKE_CURRENT_SOURCE_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${TORCH_RUNTIME_LIBRARIES}
-            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "$<TARGET_FILE_DIR:tamakeri>"
     COMMAND_EXPAND_LISTS)
 endif()

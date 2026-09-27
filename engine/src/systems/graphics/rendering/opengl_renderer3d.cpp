@@ -2533,7 +2533,7 @@ void OpenGLRenderer3D::DisableContext() {
   }
 }
 
-const screenshoot &OpenGLRenderer3D::GetScreen() {
+const Screenshot &OpenGLRenderer3D::GetScreen() {
   return last_screen_;
 }
 }

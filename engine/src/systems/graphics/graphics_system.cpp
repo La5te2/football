@@ -63,7 +63,7 @@ void GraphicsSystem::DisableContext() {
   }
 }
 
-const screenshoot &GraphicsSystem::GetScreen() {
+const Screenshot &GraphicsSystem::GetScreen() {
   return renderer3DTask->GetScreen();
 }
 

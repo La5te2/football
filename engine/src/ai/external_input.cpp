@@ -38,12 +38,6 @@ void ExternalInput::SetButton(e_ButtonFunction buttonFunction,
   buttons_pressed_[buttonFunction] = state;
 }
 
-bool ExternalInput::GetPreviousButtonState(
-    e_ButtonFunction buttonFunction) {
-  DO_VALIDATION;
-  return false;
-}
-
 blunted::Vector3 ExternalInput::GetDirection() {
   DO_VALIDATION;
   return direction_ * mirror;

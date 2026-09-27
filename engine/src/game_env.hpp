@@ -56,7 +56,7 @@ struct GameEnv {
   SharedInfo get_info();
 
   // Get the current rendered frame.
-  screenshoot get_frame();
+  Screenshot get_frame();
 
   bool window_closed() const { return quit_requested_; }
 
@@ -64,11 +64,11 @@ struct GameEnv {
   bool sticky_action_state(int action, bool left_team, int player);
   void action(int action, bool left_team, int player);
   bool set_controlled_player(bool left_team, int controller, int player);
+  void apply_model_decision(bool left_team,
+                            const GFootballModelDecision& decision);
   void load_model(const std::filesystem::path& path, bool left_team,
-                  int controller, int game_duration);
-  void start_recording(const std::filesystem::path& path,
-                       bool left_external, bool right_external,
-                       int match_duration);
+                  int game_duration);
+  void start_recording(const std::filesystem::path& path);
   void begin_recording_game(std::uint32_t seed,
                             const std::string& initial_state);
   void finish_recording_game(const SharedInfo& final_state);
@@ -80,8 +80,7 @@ struct GameEnv {
   // Selects the existing engine random stream for one match.
   void set_random_seed(std::uint32_t seed);
   void record_model_decision(
-      bool left_team, const GFootballModelObservation& observation,
-      const GFootballModelDecision& decision);
+      bool left_team, const GFootballModelDecision& decision);
   void reset(ScenarioConfig& game_config, bool init_animation);
   void render(bool swap_buffer = true);
   std::string get_state(const std::string& pickle);

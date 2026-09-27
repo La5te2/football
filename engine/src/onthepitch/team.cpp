@@ -160,6 +160,7 @@ int Team::GetActivePlayersCount() const {
 void Team::AddExternalControllers(const std::vector<ExternalInput*>& inputs) {
   DO_VALIDATION;
   for (auto input : inputs) {
+    input->SetDisabled(true);
     externalControllers.push_back(
         std::make_unique<ExternalController>(this, input));
   }

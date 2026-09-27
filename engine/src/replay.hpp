@@ -17,9 +17,6 @@
 // One decision step stored in a native match recording.
 struct ReplayStep {
   std::int32_t step = 0;
-  std::array<std::uint8_t, 2> has_observation{};
-  std::array<GFootballModelObservation, 2> observations{};
-  std::array<std::uint8_t, 2> has_decision{};
   std::array<GFootballModelDecision, 2> decisions{};
 };
 
@@ -34,9 +31,7 @@ struct ReplayGame {
 
 class ReplayWriter final {
  public:
-  ReplayWriter(const std::filesystem::path& path,
-               const std::array<std::uint8_t, 2>& external_teams,
-               std::int32_t match_duration);
+  explicit ReplayWriter(const std::filesystem::path& path);
   ~ReplayWriter();
   ReplayWriter(const ReplayWriter&) = delete;
   ReplayWriter& operator=(const ReplayWriter&) = delete;
@@ -49,12 +44,9 @@ class ReplayWriter final {
 
  private:
   std::ofstream stream_;
-  std::streampos game_count_offset_{};
   std::streampos current_step_count_offset_{};
   std::streampos current_final_step_offset_{};
   std::streampos current_goals_offset_{};
-  std::array<std::uint8_t, 2> external_teams_{};
-  std::int32_t match_duration_ = 0;
   std::int32_t game_count_ = 0;
   std::int32_t current_step_count_ = 0;
   std::int32_t last_recorded_step_ = -1;
@@ -66,14 +58,10 @@ class ReplayReader final {
  public:
   explicit ReplayReader(const std::filesystem::path& path);
 
-  bool external_team(int side) const { return external_teams_.at(side) != 0; }
-  std::int32_t match_duration() const { return match_duration_; }
   std::size_t game_count() const { return games_.size(); }
   const ReplayGame& game(std::size_t index) const { return games_.at(index); }
 
  private:
-  std::array<std::uint8_t, 2> external_teams_{};
-  std::int32_t match_duration_ = 0;
   std::vector<ReplayGame> games_;
 };
 
