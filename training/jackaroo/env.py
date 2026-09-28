@@ -14,6 +14,7 @@ if os.name == "nt" and BIN.is_dir():
     os.add_dll_directory(str(BIN))
 
 from . import _gfootball_env as native
+from .adapter import JackarooAdapter, POLICY_ACTION_COUNT
 
 
 Observation = dict[str, Any]
@@ -22,7 +23,7 @@ Observation = dict[str, Any]
 class FootballEnv:
     """One left-side external agent playing against the built-in team AI."""
 
-    action_count = native.ACTION_COUNT
+    action_count = POLICY_ACTION_COUNT
 
     def __init__(self, maximum_steps: int = 3000, seed: int | None = None) -> None:
         data = BIN / "data" if (BIN / "data").is_dir() else ROOT / "engine" / "data"
@@ -30,22 +31,31 @@ class FootballEnv:
         font = fonts / "AlegreyaSansSC-ExtraBold.ttf"
         self.maximum_steps = maximum_steps
         self._seed_generator = random.Random(seed)
+        self._adapter = JackarooAdapter()
         self._native = native.create(str(data), str(font), maximum_steps)
         self._observation: Observation | None = None
 
     def reset(self, seed: int | None = None) -> Observation:
         if seed is None:
             seed = self._seed_generator.getrandbits(32)
+        self._adapter.reset()
         self._observation = native.reset(self._native, seed & 0xFFFFFFFF)
         return self._observation
 
+    @property
+    def action_required(self) -> bool:
+        if self._observation is None:
+            raise RuntimeError("reset() must be called before reading action_required")
+        return self._adapter.action_required(self._observation)
+
     def step(
-        self, action: int
+        self, action: int | None
     ) -> tuple[Observation, float, bool, dict[str, Any]]:
         if self._observation is None:
             raise RuntimeError("reset() must be called before step()")
         previous = self._observation
-        current, terminated = native.step(self._native, action)
+        decision = self._adapter.map(previous, action)
+        current, terminated = native.step(self._native, decision)
         reward = self._reward(previous, current)
         self._observation = current
         info = {

@@ -290,15 +290,33 @@ PyObject* Reset(PyObject*, PyObject* arguments) {
 
 PyObject* Step(PyObject*, PyObject* arguments) {
   PyObject* capsule = nullptr;
-  int action = 0;
-  if (!PyArg_ParseTuple(arguments, "Oi", &capsule, &action)) {
+  PyObject* decision_object = nullptr;
+  if (!PyArg_ParseTuple(arguments, "OO", &capsule, &decision_object)) {
     return nullptr;
   }
   TrainingEnvironment* environment = GetEnvironment(capsule);
   if (!environment) return nullptr;
+  PyObject* sequence = PySequence_Fast(
+      decision_object, "decision must be a sequence of eleven actions");
+  if (!sequence) return nullptr;
+  if (PySequence_Fast_GET_SIZE(sequence) != kGFootballPlayersPerTeam) {
+    Py_DECREF(sequence);
+    PyErr_SetString(PyExc_ValueError, "decision must contain eleven actions");
+    return nullptr;
+  }
+  std::array<std::int32_t, kGFootballPlayersPerTeam> decision{};
+  for (int index = 0; index < kGFootballPlayersPerTeam; ++index) {
+    const long action = PyLong_AsLong(PySequence_Fast_GET_ITEM(sequence, index));
+    if (action == -1 && PyErr_Occurred()) {
+      Py_DECREF(sequence);
+      return nullptr;
+    }
+    decision[index] = static_cast<std::int32_t>(action);
+  }
+  Py_DECREF(sequence);
   return TranslateExceptions([&]() {
     const TrainingObservation observation =
-        environment->Step(action);
+        environment->Step(decision);
     PyObject* result = PyTuple_New(2);
     PyObject* state = ObservationToPython(observation);
     PyObject* terminated = PyBool_FromLong(
@@ -337,7 +355,7 @@ PyModuleDef module = {
 PyMODINIT_FUNC PyInit__gfootball_env() {
   PyObject* result = PyModule_Create(&module);
   if (!result) return nullptr;
-  if (PyModule_AddIntConstant(result, "ACTION_COUNT",
+  if (PyModule_AddIntConstant(result, "ENGINE_ACTION_COUNT",
                               game_delegate) < 0) {
     Py_DECREF(result);
     return nullptr;

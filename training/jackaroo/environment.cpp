@@ -115,23 +115,24 @@ TrainingObservation TrainingEnvironment::Reset(std::uint32_t seed) {
   return Observe();
 }
 
-// Applies one action to the engine-designated left player and advances one
-// 100 ms decision step.
-TrainingObservation TrainingEnvironment::Step(int action) {
-  if (action < game_idle || action >= game_delegate) {
-    throw std::out_of_range("action must be in [0, 31]");
-  }
+// Applies one complete model-interface decision and advances one 100 ms step.
+TrainingObservation TrainingEnvironment::Step(
+    const std::array<std::int32_t, kGFootballPlayersPerTeam>& actions) {
   {
     ContextHolder context(environment_.get());
     const SharedInfo state = environment_->get_info();
-    const int controlled_player = state.teams[0].designated_possession_player;
-    if (state.is_in_play && controlled_player >= 0 &&
-        controlled_player < kGFootballPlayersPerTeam) {
+    if (state.is_in_play) {
       GFootballModelDecision decision{};
-      for (int player = 0; player < kGFootballPlayersPerTeam; ++player) {
-        decision.actions[player] = game_delegate;
+      for (int index = 0; index < kGFootballPlayersPerTeam; ++index) {
+        const int action = actions[index];
+        if (action < game_idle || action > game_delegate) {
+          throw std::out_of_range("decision action must be in [0, 32]");
+        }
+        if (action != game_delegate && !state.left_team.at(index).is_active) {
+          throw std::invalid_argument("decision targets an inactive player");
+        }
+        decision.actions[index] = action;
       }
-      decision.actions[controlled_player] = action;
       environment_->apply_model_decision(true, decision);
     }
     environment_->step();

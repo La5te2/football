@@ -359,34 +359,20 @@ int TamakEriAdapter::Submit(int action) {
   return backend;
 }
 
-// Maps the engine-designated recipient into the common action array, updates
-// policy history, runs inference, and keeps both halves of a directed kick on
-// the same player.
+// Runs inference for the designated player unless that player must finish a
+// pending directed kick. When designation changes, the previous player finishes
+// its pending action while the newly designated player starts a new decision.
 GFootballModelDecision TamakEriAdapter::Decide(
     const GFootballModelObservation& state) {
-  auto decision = [this](int player, int action) {
+  auto delegated = []() {
     GFootballModelDecision result{};
     std::fill(std::begin(result.actions), std::end(result.actions), kDelegate);
-    if (player >= 0) result.actions[player] = Submit(action);
     return result;
   };
   auto update_history = [this]() {
     action_history_.push_back(last_action_);
     while (action_history_.size() > 8) action_history_.pop_front();
   };
-
-  if (pending_action_ >= 0) {
-    update_history();
-    const int action = pending_action_;
-    const int player = pending_player_;
-    pending_action_ = -1;
-    pending_player_ = -1;
-    if (player >= 0 && player < kGFootballPlayersPerTeam &&
-        state.teams[side_][player].is_active) {
-      return decision(player, action);
-    }
-    return decision(-1, kIdle);
-  }
 
   const int designated_player =
       state.team_state[side_].designated_possession_player;
@@ -395,18 +381,57 @@ GFootballModelDecision TamakEriAdapter::Decide(
               state.teams[side_][designated_player].is_active
           ? designated_player
           : -1;
-  if (controlled_player < 0) return decision(-1, kIdle);
+  const bool pending_active =
+      pending_action_ >= 0 && pending_player_ >= 0 &&
+      pending_player_ < kGFootballPlayersPerTeam &&
+      state.teams[side_][pending_player_].is_active;
+  if (!pending_active) {
+    pending_action_ = -1;
+    pending_player_ = -1;
+  }
+
+  if (pending_active && pending_player_ == controlled_player) {
+    update_history();
+    const int action = pending_action_;
+    const int player = pending_player_;
+    pending_action_ = -1;
+    pending_player_ = -1;
+    GFootballModelDecision result = delegated();
+    result.actions[player] = Submit(action);
+    return result;
+  }
+
+  const int previous_action = pending_active ? pending_action_ : -1;
+  const int previous_player = pending_active ? pending_player_ : -1;
+  pending_action_ = -1;
+  pending_player_ = -1;
+  if (controlled_player < 0) {
+    GFootballModelDecision result = delegated();
+    if (previous_player >= 0) {
+      update_history();
+      result.actions[previous_player] = Submit(previous_action);
+    }
+    return result;
+  }
+
   update_history();
   const Observation observation = Convert(state, controlled_player);
   torch::InferenceMode inference_mode;
   const at::Tensor logits = model_.forward(Features(observation)).toTensor();
   const int action = ChooseAction(observation, logits);
+  int first_action = action;
   if (action >= kDirectedKickBegin) {
     const int offset = action - kDirectedKickBegin;
     const int kick = offset / 8;
     pending_action_ = offset % 8 + 1;
     pending_player_ = controlled_player;
-    return decision(controlled_player, 9 + kick);
+    first_action = 9 + kick;
   }
-  return decision(controlled_player, action);
+
+  GFootballModelDecision result = delegated();
+  if (previous_player >= 0) {
+    result.actions[previous_player] = Submit(previous_action);
+  }
+  result.actions[controlled_player] = Submit(first_action);
+  return result;
 }

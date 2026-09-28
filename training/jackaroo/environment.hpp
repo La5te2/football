@@ -25,7 +25,8 @@ class TrainingEnvironment {
   ~TrainingEnvironment();
 
   TrainingObservation Reset(std::uint32_t seed);
-  TrainingObservation Step(int action);
+  TrainingObservation Step(
+      const std::array<std::int32_t, kGFootballPlayersPerTeam>& actions);
   int maximum_steps() const { return maximum_steps_; }
 
  private:

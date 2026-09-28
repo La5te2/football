@@ -1,0 +1,1 @@
+AI in this engine code represents a built-in AI, AKA a automatic strategic system.
