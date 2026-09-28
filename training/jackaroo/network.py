@@ -1,4 +1,4 @@
-"""Actor-critic network for the single-player action policy."""
+"""ODA-initialized actor-critic network for the Jackaroo policy."""
 
 from __future__ import annotations
 
@@ -6,27 +6,66 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 
+from .attention import ODAEncoder
+
 
 class ActorCritic(nn.Module):
-    def __init__(self, observation_size: int, action_count: int) -> None:
+    """Encode public observation histories and predict actions and value."""
+
+    def __init__(self, frame_size: int, action_count: int) -> None:
         super().__init__()
-        self.body = nn.Sequential(
-            nn.Linear(observation_size, 256),
+        self.oda = ODAEncoder()
+        self.global_encoder = nn.Sequential(
+            nn.Linear(frame_size, 128),
             nn.Tanh(),
-            nn.Linear(256, 256),
-            nn.Tanh(),
+        )
+        self.temporal = nn.GRU(
+            128 + self.oda.output_width, 256, batch_first=True
         )
         self.action_head = nn.Linear(256, action_count)
         self.value_head = nn.Linear(256, 1)
 
+    def initialize_oda(self, source: ODAEncoder) -> None:
+        """Initialize the policy relation encoder from pretrained ODA weights."""
+
+        self.oda.load_state_dict(source.state_dict())
+
     def forward(
-        self, observation: torch.Tensor
+        self,
+        encoded: torch.Tensor,
+        own: torch.Tensor,
+        opponent: torch.Tensor,
+        context: torch.Tensor,
+        anchor_indices: torch.Tensor,
+        opponent_anchor_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = self.body(observation)
+        relation, _, _ = self.oda(
+            own,
+            opponent,
+            context,
+            anchor_indices,
+            opponent_anchor_indices,
+        )
+        sequence = torch.cat((self.global_encoder(encoded), relation), dim=-1)
+        temporal, _ = self.temporal(sequence)
+        hidden = temporal[:, -1]
         return self.action_head(hidden), self.value_head(hidden).squeeze(-1)
 
     def distributions(
-        self, observation: torch.Tensor
+        self,
+        encoded: torch.Tensor,
+        own: torch.Tensor,
+        opponent: torch.Tensor,
+        context: torch.Tensor,
+        anchor_indices: torch.Tensor,
+        opponent_anchor_indices: torch.Tensor,
     ) -> tuple[Categorical, torch.Tensor]:
-        action_logits, value = self(observation)
+        action_logits, value = self(
+            encoded,
+            own,
+            opponent,
+            context,
+            anchor_indices,
+            opponent_anchor_indices,
+        )
         return Categorical(logits=action_logits), value
