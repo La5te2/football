@@ -16,7 +16,7 @@ struct ScenarioConfig;
 
 using TrainingObservation = GFootballModelObservation;
 
-// Owns one headless left-model-versus-built-in-AI training simulation.
+// Owns one headless model-versus-built-in-AI training simulation.
 class TrainingEnvironment {
  public:
   TrainingEnvironment(const std::filesystem::path& data_directory,
@@ -24,13 +24,14 @@ class TrainingEnvironment {
                       int maximum_steps);
   ~TrainingEnvironment();
 
-  TrainingObservation Reset(std::uint32_t seed);
+  TrainingObservation Reset(std::uint32_t seed, bool left_team);
   TrainingObservation Step(
       const std::array<std::int32_t, kGFootballPlayersPerTeam>& actions);
   int maximum_steps() const { return maximum_steps_; }
 
  private:
   TrainingObservation Observe();
+  bool left_team_ = true;
   std::unique_ptr<GameEnv> environment_;
   std::unique_ptr<ScenarioConfig> scenario_;
   int maximum_steps_;

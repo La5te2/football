@@ -31,7 +31,7 @@ PASS_COMPLETION_STEPS = 20
 
 
 class FootballEnv:
-    """One left-side external agent playing against the built-in team AI."""
+    """One external agent playing either physical side against built-in AI."""
 
     action_count = native.ENGINE_ACTION_COUNT
 
@@ -41,6 +41,7 @@ class FootballEnv:
         font = fonts / "AlegreyaSansSC-ExtraBold.ttf"
         self.maximum_steps = maximum_steps
         self._seed_generator = random.Random(seed)
+        self._next_left_team = True
         self._native = native.create(str(data), str(font), maximum_steps)
         self._observation: Observation | None = None
         self._stable_possession_team = -1
@@ -52,7 +53,11 @@ class FootballEnv:
     def reset(self, seed: int | None = None) -> Observation:
         if seed is None:
             seed = self._seed_generator.getrandbits(32)
-        self._observation = native.reset(self._native, seed & 0xFFFFFFFF)
+        left_team = self._next_left_team
+        self._next_left_team = not self._next_left_team
+        self._observation = native.reset(
+            self._native, seed & 0xFFFFFFFF, left_team
+        )
         self._stable_possession_team = self._observation["ball_owned_team"]
         self._pending_passer = -1
         self._pending_pass_deadline = -1

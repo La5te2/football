@@ -1,6 +1,6 @@
 # Jackaroo
 
-This module provides a headless single-agent environment and a PyTorch implementation of clipped Proximal Policy Optimization. The policy controls the engine-designated player on the left team against the built-in AI and selects one of the engine's 32 atomic actions.
+This module provides a headless single-agent environment and a PyTorch implementation of clipped Proximal Policy Optimization. The policy controls the engine-designated player against the built-in AI and selects one of the engine's 32 atomic actions. Consecutive matches alternate the controlled physical side, while observations use a canonical own-team-attacks-right coordinate system.
 
 Every engine step returns its observation. The selected action is assigned to the engine-designated player and every other player is delegated to the built-in Eliza controllers. Team formation, tactics, set pieces, and the remaining player behavior retain the engine defaults.
 

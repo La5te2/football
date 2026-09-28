@@ -710,7 +710,162 @@ $$
 
 第一组衡量稀疏结果奖励的基础表现。第二组衡量 learned potential 的贡献。第三组衡量 ODA 表示对势能质量和策略学习的贡献。
 
-## 13. 拟文件树
+## 13. 潜在问题与解决方案
+
+### 13.1 势能分布偏移
+
+势能模型从内置 AI 轨迹开始学习，Jackaroo 进入较少访问的局面后会产生分布偏移。训练数据采用长期基础集合、历史 Jackaroo 轨迹和近期 Jackaroo 轨迹的混合采样。基础集合维持局面多样性，近期集合覆盖当前策略的状态分布，固定验证集负责评估跨分布校准质量。
+
+势能模型使用 $K$ 个独立初始化的成员估计预测分歧：
+
+$$
+\bar{\Phi}(x)
+=
+\frac{1}{K}
+\sum_{j=1}^{K}
+\Phi_j(x),
+\qquad
+\sigma_{\Phi}^{2}(x)
+=
+\frac{1}{K}
+\sum_{j=1}^{K}
+\left(\Phi_j(x)-\bar{\Phi}(x)\right)^2.
+$$
+
+有效势能采用不确定性置信系数：
+
+$$
+\Psi(x)
+=
+\beta c(x)\bar{\Phi}(x),
+\qquad
+c(x)
+=
+\exp\left(-\lambda\sigma_{\Phi}^{2}(x)\right).
+$$
+
+成员分歧较大的局面自动获得较小的 shaping 权重。正式评价继续使用比赛终场结果，势能指标承担信用分配与诊断职责。
+
+### 13.2 ODA 标签质量
+
+攻防注意力标签采用状态机生成。状态机综合球队球权、最近触球者、球员到球时间和连续观测，使用迟滞阈值确认球权转换。争抢、解围和球权归属模糊的时间段获得较低标签置信度。
+
+ODA 分类使用置信度加权交叉熵：
+
+$$
+\mathcal{L}_{\mathrm{ODA}}
+=
+-\sum_t w_t
+\sum_i y_{t,i}\log p_{t,i},
+\qquad
+w_t\in[0,1].
+$$
+
+数据管线保存候选标签、最终标签和 $w_t$，并通过按比赛划分的标签一致性报告监控状态机质量。
+
+### 13.3 势能刷新与 PPO 稳定性
+
+每个 PPO 区间使用一份冻结势能快照。采样、奖励计算和 PPO 更新共享同一份 $\Psi_k$，候选势能在区间边界完成训练与校准后进入下一轮。
+
+势能更新顺序为：
+
+1. 冻结 $\Psi_k$。
+2. 使用 $\Psi_k$ 收集完整 rollout。
+3. 使用 $\Psi_k$ 计算 rollout 中每一步的 shaping reward。
+4. 使用该 rollout 完成 PPO 更新。
+5. 训练候选势能并在固定验证集上校准。
+6. 生成下一个区间的 $\Psi_{k+1}$。
+
+区间之间可以使用插值限制变化幅度：
+
+$$
+\Psi_{k+1}
+=
+(1-\alpha)\Psi_k
++
+\alpha\widehat{\Psi}_{k+1},
+\qquad
+\alpha\in[0,1].
+$$
+
+验证集上的平均变化量作为刷新门槛：
+
+$$
+\frac{1}{|\mathcal{V}|}
+\sum_{x\in\mathcal{V}}
+\left|
+\Psi_{k+1}(x)-\Psi_k(x)
+\right|
+\leq\epsilon.
+$$
+
+### 13.4 势能差的累计性质
+
+势能差采用与 PPO 相同的折扣因子：
+
+$$
+F_t
+=
+\gamma\Psi(x_{t+1})-\Psi(x_t).
+$$
+
+其折扣累计值满足：
+
+$$
+\sum_{t=0}^{T-1}\gamma^tF_t
+=
+-\Psi(x_0)
++
+\gamma^T\Psi(x_T).
+$$
+
+终止状态势能设为零时，累计 shaping 项归结为初始势能项。随机初始状态产生的差异由 Critic 的状态基线和标准 advantage 归一化吸收。$\beta$ 控制单步 shaping 的优化尺度。
+
+### 13.5 左右侧对称性
+
+训练环境按比赛交替分配物理左右侧。受控侧为右侧时，原生环境输出经过 180° 旋转，并将受控队伍放入观察的第 0 队列；方向动作按照同一旋转映射提交给物理引擎。策略始终使用“己方进攻方向为正 $x$ 轴”的规范坐标。
+
+镜像变换 $\mathcal{M}$ 用于检验势能的结果对称性：
+
+$$
+\Phi_{\theta}(\mathcal{M}(x))
+=
+-\Phi_{\theta}(x).
+$$
+
+训练中采用软对称损失：
+
+$$
+\mathcal{L}_{\mathrm{sym}}
+=
+\left(
+\Phi_{\theta}(\mathcal{M}(x))
++
+\Phi_{\theta}(x)
+\right)^2.
+$$
+
+总损失写为：
+
+$$
+\mathcal{L}
+=
+\mathcal{L}_{\mathrm{outcome}}
++
+\lambda_{\mathrm{sym}}\mathcal{L}_{\mathrm{sym}}.
+$$
+
+### 13.6 动作空间与观察历史
+
+Jackaroo 使用引擎的 32 个原子动作。训练管线根据比赛模式和动作阶段生成合法动作掩码，观察中的 `action_frame`、`touch_frame`、粘滞动作与球员速度提供动作延续所需的上下文。观察编码保留完整公共字段，历史建模采用固定窗口 $L$ 或因果循环编码器，并通过传球飞行和攻防转换场景的验证集确定有效历史范围。
+
+### 13.7 训练验证与漏洞监控
+
+势能模型提供信用分配信号，终场胜平负提供最终任务指标。训练记录终场结果、势能预测校准、势能累计项、动作分布、控球转换和射门事件。Terminal PPO、Learned Potential PPO 与 ODA-Conditioned Learned Potential PPO 使用相同网络容量、环境步数、随机种子集合和评价比赛集合完成消融比较。
+
+势能预测与终场胜率出现分离时，训练器降低势能快照的 $\beta$，保留终场任务回报的主导地位，并在固定验证比赛集合上复核策略表现。
+
+## 14. 拟文件树
 
 - `dataset.py` 负责轨迹读取、规范坐标变换、标签构造和数据划分。
 - `attention.py` 负责实体编码、对手注意力、队友注意力和 ODA 分类头。
@@ -723,7 +878,7 @@ $$
 
 模型接口维持现有 32 原子动作和完整公共观察。训练模块通过字段复制构造张量，势能模型与策略模型维护独立参数。
 
-## 14. 参考资料
+## 15. 参考资料
 
 - [Offensive and Defensive Attention Reward in Reinforcement Learning for Football Game](./ODAR.pdf)
 - [Policy Invariance Under Reward Transformations: Theory and Application to Reward Shaping](./PBRS.pdf)

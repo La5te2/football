@@ -34,7 +34,7 @@ def main() -> None:
     policy.eval()
 
     for game in range(arguments.games):
-        observation = environment.reset(arguments.seed + game)
+        observation = environment.reset(arguments.seed + game // 2)
         terminated = False
         info = {"goals": (0, 0)}
         while not terminated:

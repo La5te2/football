@@ -55,10 +55,13 @@ void AddFormation(std::vector<FormationEntry>& team, bool kickoff_team) {
   }
 }
 
-void CopyPosition(const Position& source, float destination[3]) {
-  for (int axis = 0; axis < 3; ++axis) {
-    destination[axis] = source.env_coord(axis);
-  }
+int OppositeDirection(int action) {
+  static constexpr int directions[] = {
+      game_right, game_bottom_right, game_bottom, game_bottom_left,
+      game_left, game_top_left, game_top, game_top_right};
+  return action >= game_left && action <= game_bottom_left
+      ? directions[action - game_left]
+      : action;
 }
 
 }  // namespace
@@ -97,7 +100,11 @@ TrainingEnvironment::TrainingEnvironment(
 TrainingEnvironment::~TrainingEnvironment() = default;
 
 // Restarts the complete match and advances through the noninteractive startup.
-TrainingObservation TrainingEnvironment::Reset(std::uint32_t seed) {
+TrainingObservation TrainingEnvironment::Reset(std::uint32_t seed,
+                                               bool left_team) {
+  left_team_ = left_team;
+  scenario_->left_agents = left_team ? kGFootballPlayersPerTeam : 0;
+  scenario_->right_agents = left_team ? 0 : kGFootballPlayersPerTeam;
   scenario_->game_engine_random_seed = seed;
   environment_->reset(*scenario_, false);
   while (true) {
@@ -123,17 +130,20 @@ TrainingObservation TrainingEnvironment::Step(
     const SharedInfo state = environment_->get_info();
     if (state.is_in_play) {
       GFootballModelDecision decision{};
+      const auto& physical_team =
+          left_team_ ? state.left_team : state.right_team;
       for (int index = 0; index < kGFootballPlayersPerTeam; ++index) {
         const int action = actions[index];
         if (action < game_idle || action > game_delegate) {
           throw std::out_of_range("decision action must be in [0, 32]");
         }
-        if (action != game_delegate && !state.left_team.at(index).is_active) {
+        if (action != game_delegate && !physical_team.at(index).is_active) {
           throw std::invalid_argument("decision targets an inactive player");
         }
-        decision.actions[index] = action;
+        decision.actions[index] = left_team_ ? action
+                                             : OppositeDirection(action);
       }
-      environment_->apply_model_decision(true, decision);
+      environment_->apply_model_decision(left_team_, decision);
     }
     environment_->step();
   }
@@ -146,27 +156,40 @@ TrainingObservation TrainingEnvironment::Observe() {
   ContextHolder context(environment_.get());
   const SharedInfo state = environment_->get_info();
   TrainingObservation observation{};
-  CopyPosition(state.ball_position, observation.ball_position);
-  CopyPosition(state.ball_velocity, observation.ball_velocity);
-  CopyPosition(state.ball_rotation, observation.ball_rotation);
+  const int own_side = left_team_ ? 0 : 1;
+  const int opponent_side = 1 - own_side;
+  const float rotation = left_team_ ? 1.0f : -1.0f;
+  auto copy_canonical = [rotation](const Position& source,
+                                   float destination[3]) {
+    destination[0] = rotation * source.env_coord(0);
+    destination[1] = rotation * source.env_coord(1);
+    destination[2] = source.env_coord(2);
+  };
+  copy_canonical(state.ball_position, observation.ball_position);
+  copy_canonical(state.ball_velocity, observation.ball_velocity);
+  copy_canonical(state.ball_rotation, observation.ball_rotation);
   const std::vector<PlayerInfo>* teams[] = {&state.left_team,
                                             &state.right_team};
+  const int canonical_side[] = {own_side, opponent_side};
   for (int side = 0; side < 2; ++side) {
-    if (teams[side]->size() != kGFootballPlayersPerTeam) {
+    const int physical_side = canonical_side[side];
+    if (teams[physical_side]->size() != kGFootballPlayersPerTeam) {
       throw std::runtime_error("engine did not return eleven players per team");
     }
     for (int player = 0; player < kGFootballPlayersPerTeam; ++player) {
-      const PlayerInfo& source = teams[side]->at(player);
+      const PlayerInfo& source = teams[physical_side]->at(player);
       GFootballModelPlayer& target = observation.teams[side][player];
-      CopyPosition(source.player_position, target.position);
-      CopyPosition(source.player_velocity, target.velocity);
-      CopyPosition(source.player_facing, target.facing);
-      target.formation_position[0] = source.formation_position.env_coord(0);
-      target.formation_position[1] = source.formation_position.env_coord(1);
+      copy_canonical(source.player_position, target.position);
+      copy_canonical(source.player_velocity, target.velocity);
+      copy_canonical(source.player_facing, target.facing);
+      target.formation_position[0] =
+          rotation * source.formation_position.env_coord(0);
+      target.formation_position[1] =
+          rotation * source.formation_position.env_coord(1);
       target.dynamic_formation_position[0] =
-          source.dynamic_formation_position.env_coord(0);
+          rotation * source.dynamic_formation_position.env_coord(0);
       target.dynamic_formation_position[1] =
-          source.dynamic_formation_position.env_coord(1);
+          rotation * source.dynamic_formation_position.env_coord(1);
       target.tired_factor = source.tired_factor;
       target.role = source.role;
       target.dynamic_role = source.dynamic_role;
@@ -180,24 +203,30 @@ TrainingObservation TrainingEnvironment::Observe() {
       target.touch_pending = source.touch_pending;
     }
 
-    const TeamInfo& source_team = state.teams[side];
+    const TeamInfo& source_team = state.teams[physical_side];
     GFootballModelTeamState& target_team = observation.team_state[side];
     target_team.possession_amount = source_team.possession_amount;
     target_team.fading_possession_amount =
         source_team.fading_possession_amount;
-    target_team.offside_trap_x = source_team.offside_trap_x;
+    target_team.offside_trap_x = rotation * source_team.offside_trap_x;
     target_team.designated_possession_player =
         source_team.designated_possession_player;
     target_team.time_to_ball_ms = source_team.time_to_ball_ms;
   }
-  observation.goals[0] = state.left_goals;
-  observation.goals[1] = state.right_goals;
+  observation.goals[0] = left_team_ ? state.left_goals : state.right_goals;
+  observation.goals[1] = left_team_ ? state.right_goals : state.left_goals;
   observation.game_mode = state.game_mode;
-  observation.set_piece_team = state.set_piece_team;
+  observation.set_piece_team = state.set_piece_team < 0
+      ? -1
+      : (state.set_piece_team == own_side ? 0 : 1);
   observation.set_piece_taker = state.set_piece_taker;
-  observation.ball_owned_team = state.ball_owned_team;
+  observation.ball_owned_team = state.ball_owned_team < 0
+      ? -1
+      : (state.ball_owned_team == own_side ? 0 : 1);
   observation.ball_owned_player = state.ball_owned_player;
-  observation.last_touch_team = state.last_touch_team;
+  observation.last_touch_team = state.last_touch_team < 0
+      ? -1
+      : (state.last_touch_team == own_side ? 0 : 1);
   observation.last_touch_player = state.last_touch_player;
   observation.match_time_ms = state.match_time_ms;
   observation.step = state.step;
@@ -208,8 +237,10 @@ TrainingObservation TrainingEnvironment::Observe() {
       game_dribble};
   for (int player = 0; player < kGFootballPlayersPerTeam; ++player) {
     for (int index = 0; index < kGFootballStickyActionCount; ++index) {
+      int physical_action = sticky_actions[index];
+      if (!left_team_) physical_action = OppositeDirection(physical_action);
       observation.sticky_actions[player][index] =
-          environment_->sticky_action_state(sticky_actions[index], true,
+          environment_->sticky_action_state(physical_action, left_team_,
                                              player);
     }
   }

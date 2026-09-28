@@ -279,12 +279,15 @@ PyObject* Create(PyObject*, PyObject* arguments, PyObject* keywords) {
 PyObject* Reset(PyObject*, PyObject* arguments) {
   PyObject* capsule = nullptr;
   unsigned long seed = 0;
-  if (!PyArg_ParseTuple(arguments, "Ok", &capsule, &seed)) return nullptr;
+  int left_team = 1;
+  if (!PyArg_ParseTuple(arguments, "Ok|p", &capsule, &seed, &left_team)) {
+    return nullptr;
+  }
   TrainingEnvironment* environment = GetEnvironment(capsule);
   if (!environment) return nullptr;
   return TranslateExceptions([&]() {
     return ObservationToPython(
-        environment->Reset(static_cast<std::uint32_t>(seed)));
+        environment->Reset(static_cast<std::uint32_t>(seed), left_team != 0));
   });
 }
 
