@@ -21,7 +21,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
-        "--checkpoint", type=Path, default=Path("checkpoints/ppo.pt")
+        "--checkpoint", type=Path, default=Path("checkpoints/jackaroo.pt")
     )
     parser.add_argument("--seed", type=int, default=1)
     return parser.parse_args()

@@ -22,7 +22,7 @@ if(MSVC)
   add_compile_options(/utf-8)
 endif()
 
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../engine" engine EXCLUDE_FROM_ALL)
+add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../engine" engine EXCLUDE_FROM_ALL)
 
 if(WIN32)
   find_program(GFOOTBALL_HOST_PYTHON NAMES python
@@ -65,8 +65,8 @@ endif()
 
 target_link_libraries(_gfootball_env PRIVATE gfootball_engine)
 target_include_directories(_gfootball_env PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/../engine/src"
-  "${CMAKE_CURRENT_SOURCE_DIR}/../engine/src/cmake")
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../engine/src"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../../engine/src/cmake")
 
 set_target_properties(_gfootball_env PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"

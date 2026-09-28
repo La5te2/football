@@ -8,7 +8,7 @@ import random
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "bin"
 if os.name == "nt" and BIN.is_dir():
     os.add_dll_directory(str(BIN))
@@ -59,10 +59,16 @@ class FootballEnv:
         own_goal = current["goals"][0] - previous["goals"][0]
         opponent_goal = current["goals"][1] - previous["goals"][1]
         score = float(own_goal - opponent_goal)
-        progress = 0.01 * (
+        if score != 0.0:
+            return score
+
+        progress = 0.05 * (
             current["ball_position"][0] - previous["ball_position"][0]
         )
-        possession = 0.001 if current["ball_owned_team"] == 0 else 0.0
-        if current["ball_owned_team"] == 1:
-            possession = -0.001
-        return score + progress + possession
+        possession_change = 0.0
+        if previous["ball_owned_team"] != current["ball_owned_team"]:
+            if current["ball_owned_team"] == 0:
+                possession_change = 0.01
+            elif previous["ball_owned_team"] == 0:
+                possession_change = -0.01
+        return progress + possession_change

@@ -1,4 +1,4 @@
-# Training
+# Jackaroo
 
 This module provides a headless single-agent environment and a PyTorch implementation of clipped Proximal Policy Optimization. The policy controls the engine-designated player on the left team against the built-in AI and selects one of the 32 atomic engine actions every 100 ms.
 
@@ -9,13 +9,13 @@ The training environment uses the same public observation and 11-player decision
 Build the native Python module with the Python interpreter containing PyTorch active on `PATH`:
 
 ```powershell
-.\training\build.bat
+.\training\jackaroo\build.bat
 ```
 
 On Linux, run:
 
 ```bash
-./training/build.sh
+./training/jackaroo/build.sh
 ```
 
 ## Training
@@ -23,13 +23,13 @@ On Linux, run:
 Start training with the default 3000-step match length:
 
 ```powershell
-python -m training.train
+python -m training.jackaroo.train
 ```
 
-The default checkpoint is `checkpoints/ppo.pt`. Rollout length, update count, learning rate, match length, seed, and checkpoint path can be configured from the command line:
+The default checkpoint is `checkpoints/jackaroo.pt`. Rollout length, update count, learning rate, match length, seed, and checkpoint path can be configured from the command line:
 
 ```powershell
-python -m training.train --updates 1000 --steps-per-update 2048 --maximum-steps 3000 --learning-rate 0.0003 --device auto --seed 1 --checkpoint checkpoints\ppo.pt
+python -m training.jackaroo.train --updates 1000 --steps-per-update 2048 --maximum-steps 3000 --learning-rate 0.0003 --device auto --seed 1 --checkpoint checkpoints\jackaroo.pt
 ```
 
 ## Evaluation
@@ -37,7 +37,7 @@ python -m training.train --updates 1000 --steps-per-update 2048 --maximum-steps 
 Evaluate a checkpoint against the same built-in opponent:
 
 ```powershell
-python -m training.evaluate checkpoints\ppo.pt --games 10 --device auto --seed 1
+python -m training.jackaroo.evaluate checkpoints\jackaroo.pt --games 10 --device auto --seed 1
 ```
 
-The environment reward is the left-team goal difference increment plus small ball-progress and possession terms. Evaluation reports the final score without changing the policy.
+The environment reward gives `+1` for scoring and `-1` for conceding. Non-scoring steps add a small reward for moving the ball toward the opponent's goal, `+0.01` when the left team gains possession, and `-0.01` when it loses possession. Holding possession has no recurring reward. Evaluation reports the final score without changing the policy.

@@ -99,6 +99,14 @@ bool ParsePositiveInteger(const std::string& value, int& result) {
          parsed.ptr == value.data() + value.size() && result > 0;
 }
 
+bool ParseSeed(const std::string& value, std::uint32_t& result) {
+  result = 0;
+  const auto parsed =
+      std::from_chars(value.data(), value.data() + value.size(), result);
+  return parsed.ec == std::errc{} &&
+         parsed.ptr == value.data() + value.size();
+}
+
 std::filesystem::path ResolvePlugin(const std::string& value,
                                     const std::filesystem::path& root) {
   std::filesystem::path path = value;
@@ -126,6 +134,8 @@ int main(int argc, char** argv) {
   std::string right = "builtin";
   std::filesystem::path record_path;
   int games = 1;
+  std::uint32_t requested_seed = 0;
+  bool has_requested_seed = false;
   bool render = true;
   bool real_time = true;
   for (int i = 1; i < argc; ++i) {
@@ -152,6 +162,18 @@ int main(int argc, char** argv) {
         ShowError("--games requires a positive integer");
         return 2;
       }
+    } else if (argument == "--seed") {
+      if (i + 1 >= argc || !ParseSeed(argv[++i], requested_seed)) {
+        ShowError("--seed requires an integer from 0 to 4294967295");
+        return 2;
+      }
+      has_requested_seed = true;
+    } else if (argument.rfind("--seed=", 0) == 0) {
+      if (!ParseSeed(argument.substr(7), requested_seed)) {
+        ShowError("--seed requires an integer from 0 to 4294967295");
+        return 2;
+      }
+      has_requested_seed = true;
     } else if (argument == "--render=false") {
       render = false;
     } else if (argument == "--real_time=false") {
@@ -229,11 +251,16 @@ int main(int argc, char** argv) {
     if (!record_path.empty()) {
       env->start_recording(record_path);
     }
-    std::random_device entropy;
-    std::seed_seq seed_material{
-        entropy(), entropy(), entropy(), entropy(),
-        entropy(), entropy(), entropy(), entropy()};
-    std::mt19937 seed_generator(seed_material);
+    std::mt19937 seed_generator;
+    if (has_requested_seed) {
+      seed_generator.seed(requested_seed);
+    } else {
+      std::random_device entropy;
+      std::seed_seq seed_material{
+          entropy(), entropy(), entropy(), entropy(),
+          entropy(), entropy(), entropy(), entropy()};
+      seed_generator.seed(seed_material);
+    }
     std::unordered_set<std::uint32_t> used_seeds;
     for (int game = 0; game < games && !env->window_closed(); ++game) {
       if (game > 0) {
@@ -241,9 +268,14 @@ int main(int argc, char** argv) {
         env->set_state(initial_state);
       }
       std::uint32_t game_seed;
-      do {
-        game_seed = seed_generator();
-      } while (!used_seeds.insert(game_seed).second);
+      if (has_requested_seed && game == 0) {
+        game_seed = requested_seed;
+        used_seeds.insert(game_seed);
+      } else {
+        do {
+          game_seed = seed_generator();
+        } while (!used_seeds.insert(game_seed).second);
+      }
       {
         ContextHolder context(env);
         env->set_random_seed(game_seed);

@@ -49,6 +49,12 @@ Use `--games <positive-integer>` to run several matches from the same initial st
 .\bin\gfootball.exe --games 10 --render=false --real_time=false
 ```
 
+Use `--seed <integer>` to reproduce a run. The first match uses the specified 32-bit seed, and additional matches receive a deterministic sequence of distinct seeds derived from it:
+
+```powershell
+.\bin\gfootball.exe --games 10 --seed 42 --render=false --real_time=false
+```
+
 In a rendered match, press Space to pause or resume. Use `[` and `]` to select 0.25x, 0.5x, 1x, or 2x playback. These controls affect presentation timing only; simulation steps and model decisions retain their original cadence.
 
 The same controller options apply to headless matches:
