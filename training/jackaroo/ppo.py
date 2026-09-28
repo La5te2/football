@@ -35,7 +35,6 @@ def collect_rollout(
     log_probabilities = []
     values = []
     rewards = []
-    durations = []
     terminated_flags = []
     completed_games: list[tuple[int, int]] = []
 
@@ -47,18 +46,11 @@ def collect_rollout(
             log_probability = action_distribution.log_prob(action)
 
         next_observation, reward, terminated, info = environment.step(action.item())
-        duration = 1
-        while not terminated and not environment.action_required:
-            forced_observation, forced_reward, terminated, info = environment.step(None)
-            reward += (gamma**duration) * forced_reward
-            duration += 1
-            next_observation = forced_observation
         observations.append(encoded)
         actions.append(action)
         log_probabilities.append(log_probability)
         values.append(value)
         rewards.append(reward)
-        durations.append(duration)
         terminated_flags.append(terminated)
 
         observation = next_observation
@@ -77,10 +69,8 @@ def collect_rollout(
     advantage = torch.tensor(0.0, device=device)
     for index in reversed(range(steps)):
         continues = 0.0 if terminated_flags[index] else 1.0
-        bootstrap_discount = gamma ** durations[index]
-        trace_discount = (gamma * gae_lambda) ** durations[index]
-        delta = rewards[index] + bootstrap_discount * next_value * continues - values[index]
-        advantage = delta + trace_discount * continues * advantage
+        delta = rewards[index] + gamma * next_value * continues - values[index]
+        advantage = delta + gamma * gae_lambda * continues * advantage
         advantages[index] = advantage
         next_value = values[index]
 

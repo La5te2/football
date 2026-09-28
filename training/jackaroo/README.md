@@ -1,8 +1,8 @@
 # Jackaroo
 
-This module provides a headless single-agent environment and a PyTorch implementation of clipped Proximal Policy Optimization. The policy controls the engine-designated player on the left team against the built-in AI and selects one of 64 policy actions.
+This module provides a headless single-agent environment and a PyTorch implementation of clipped Proximal Policy Optimization. The policy controls the engine-designated player on the left team against the built-in AI and selects one of the engine's 32 atomic actions.
 
-Policy actions `0..31` preserve all 32 atomic engine actions. Actions `32..63` add the four pass or shot inputs combined with eight directions. The Jackaroo adapter submits the first atomic action immediately and retains the second for the same player. Every engine step returns its observation. If that player remains designated, the retained action executes without another inference; if a different player becomes designated, the retained action and the new player's inferred action execute together in the shared 11-player decision. All other players are delegated to the built-in Eliza controllers. Team formation, tactics, set pieces, and the remaining player behavior retain the engine defaults.
+Every engine step returns its observation. The selected action is assigned to the engine-designated player and every other player is delegated to the built-in Eliza controllers. Team formation, tactics, set pieces, and the remaining player behavior retain the engine defaults.
 
 ## Building
 
@@ -40,4 +40,4 @@ Evaluate a checkpoint against the same built-in opponent:
 python -m training.jackaroo.evaluate checkpoints\jackaroo.pt --games 10 --device auto --seed 1
 ```
 
-The environment reward gives `+1` for scoring and `-1` for conceding. Non-scoring steps add a small reward for moving the ball toward the opponent's goal, `+0.01` when the left team gains possession, and `-0.01` when it loses possession. Holding possession has no recurring reward. Evaluation reports the final score without changing the policy.
+The environment reward gives `+1` for scoring and `-1` for conceding. Dense shaping uses the discounted change in a team-state potential composed of possession, time-to-ball advantage, available passing options, local numerical superiority, team structure, and goal threat. Small event rewards recognize a completed pass initiated by the policy and a quick counterpress recovery. Failed passes and turnovers are penalized according to their danger near the team's own goal, while an unreceived pass receives a smaller penalty. Individual components are available in `info["reward_components"]` for diagnosis. Evaluation reports the final score without changing the policy.

@@ -38,12 +38,10 @@ def main() -> None:
         terminated = False
         info = {"goals": (0, 0)}
         while not terminated:
-            action = None
-            if environment.action_required:
-                state = encode(observation, environment.maximum_steps).to(device)
-                with torch.no_grad():
-                    action_logits, _ = policy(state)
-                    action = action_logits.argmax().item()
+            state = encode(observation, environment.maximum_steps).to(device)
+            with torch.no_grad():
+                action_logits, _ = policy(state)
+                action = action_logits.argmax().item()
             observation, _, terminated, info = environment.step(action)
         print(f"game={game + 1} score={info['goals'][0]}:{info['goals'][1]}")
 
