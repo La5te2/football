@@ -23,7 +23,7 @@
 
 #include <string>
 
-#include "ai/external_input.hpp"
+#include "onthepitch/external_input.hpp"
 #include "base/log.hpp"
 #include "base/math/bluntmath.hpp"
 #include "base/utils.hpp"

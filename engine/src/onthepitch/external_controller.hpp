@@ -23,7 +23,7 @@
 #include "../scene/scene3d/scene3d.hpp"
 
 #include "player/controller/external_executor.hpp"
-#include "../ai/external_input.hpp"
+#include "external_input.hpp"
 
 using namespace blunted;
 

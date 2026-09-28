@@ -27,7 +27,7 @@
 
 #include <SDL2/SDL.h>
 
-#include "ai/external_input.hpp"
+#include "onthepitch/external_input.hpp"
 #include "file.h"
 #include "gametask.hpp"
 #include "model.hpp"

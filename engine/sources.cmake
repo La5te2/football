@@ -231,7 +231,7 @@ set(BLUNTED_CORE_SOURCES
 
 
 set(ENGINE_HEADERS
-   src/ai/external_input.hpp
+   src/onthepitch/external_input.hpp
    src/game_env.hpp
    src/model.hpp
    src/interface.hpp
@@ -239,7 +239,7 @@ set(ENGINE_HEADERS
 )
 
 set(ENGINE_SOURCES
-   src/ai/external_input.cpp
+   src/onthepitch/external_input.cpp
    src/game_env.cpp
    src/model.cpp
    src/replay.cpp

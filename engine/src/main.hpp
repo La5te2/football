@@ -21,7 +21,7 @@
 class GameEnv;
 GameEnv* GetGame();
 
-#include "ai/external_input.hpp"
+#include "onthepitch/external_input.hpp"
 #include "blunted.hpp"
 
 #include "gametask.hpp"

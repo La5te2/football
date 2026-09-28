@@ -20,7 +20,7 @@
 
 #include "playercontroller.hpp"
 
-#include "../../../ai/external_input.hpp"
+#include "../../external_input.hpp"
 
 class Player;
 
