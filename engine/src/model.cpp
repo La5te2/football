@@ -148,21 +148,6 @@ void Model::Decide(GameEnv& env, const SharedInfo& state) {
     }
     const TeamInfo& source_team = state.teams[side];
     GFootballModelTeamState& target_team = observation.team_state[side];
-    target_team.tactics = {
-        source_team.tactics.offense_depth_factor,
-        source_team.tactics.defense_depth_factor,
-        source_team.tactics.offense_width_factor,
-        source_team.tactics.defense_width_factor,
-        source_team.tactics.offense_own_half_factor,
-        source_team.tactics.defense_own_half_factor,
-        source_team.tactics.offense_midfield_focus,
-        source_team.tactics.defense_midfield_focus,
-        source_team.tactics.offense_midfield_focus_strength,
-        source_team.tactics.defense_midfield_focus_strength,
-        source_team.tactics.offense_side_focus_strength,
-        source_team.tactics.defense_side_focus_strength,
-        source_team.tactics.offense_micro_focus_strength,
-        source_team.tactics.defense_micro_focus_strength};
     target_team.possession_amount = source_team.possession_amount;
     target_team.fading_possession_amount =
         source_team.fading_possession_amount;

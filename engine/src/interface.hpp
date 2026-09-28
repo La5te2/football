@@ -31,31 +31,21 @@ struct GFootballModelPlayer {
   std::uint8_t touch_pending;
 };
 
-// The fourteen positioning factors already consumed by TeamAIController.
-// Values are normalized to [0, 1].
-struct GFootballModelTactics {
-  float offense_depth_factor;
-  float defense_depth_factor;
-  float offense_width_factor;
-  float defense_width_factor;
-  float offense_own_half_factor;
-  float defense_own_half_factor;
-  float offense_midfield_focus;
-  float defense_midfield_focus;
-  float offense_midfield_focus_strength;
-  float defense_midfield_focus_strength;
-  float offense_side_focus_strength;
-  float defense_side_focus_strength;
-  float offense_micro_focus_strength;
-  float defense_micro_focus_strength;
-};
-
 struct GFootballModelTeamState {
-  GFootballModelTactics tactics;
+  // Relative possession estimate derived from both teams' time-to-ball
+  // values. Values above 1 mean this team is estimated to reach the ball
+  // sooner; values below 1 favor the opponent.
   float possession_amount;
+  // Low-pass version of possession_amount, limited by the engine to the
+  // [0.5, 1.5] range so that short-lived estimates do not change abruptly.
   float fading_possession_amount;
+  // Current normalized field x coordinate of the engine's offside-trap
+  // reference line.
   float offside_trap_x;
+  // Zero-based player index selected by the engine's possession assignment.
   std::int32_t designated_possession_player;
+  // Estimated time in milliseconds for the fastest active player on this team
+  // to intercept the ball's predicted path.
   std::int32_t time_to_ball_ms;
 };
 

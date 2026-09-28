@@ -9,37 +9,14 @@
 #include <filesystem>
 #include <memory>
 
+#include "interface.hpp"
+
 class GameEnv;
 struct ScenarioConfig;
 
-constexpr int kTrainingPlayersPerTeam = 11;
-constexpr int kTrainingStickyActionCount = 10;
-constexpr int kTrainingActionCount = 32;
+using TrainingObservation = GFootballModelObservation;
 
-struct TrainingPlayer {
-  std::array<float, 3> position{};
-  std::array<float, 3> velocity{};
-  float tired_factor = 0.0f;
-  int role = 0;
-  bool has_card = false;
-  bool is_active = false;
-};
-
-// Public match state copied into Python after each environment decision step.
-struct TrainingObservation {
-  std::array<float, 3> ball_position{};
-  std::array<float, 3> ball_velocity{};
-  std::array<float, 3> ball_rotation{};
-  std::array<std::array<TrainingPlayer, kTrainingPlayersPerTeam>, 2> teams{};
-  std::array<int, 2> goals{};
-  int game_mode = 0;
-  int ball_owned_team = -1;
-  int ball_owned_player = -1;
-  int step = 0;
-  std::array<bool, kTrainingStickyActionCount> sticky_actions{};
-};
-
-// Owns one headless left-agent-versus-built-in-AI training simulation.
+// Owns one headless left-model-versus-built-in-AI training simulation.
 class TrainingEnvironment {
  public:
   TrainingEnvironment(const std::filesystem::path& data_directory,
@@ -48,7 +25,7 @@ class TrainingEnvironment {
   ~TrainingEnvironment();
 
   TrainingObservation Reset(std::uint32_t seed);
-  TrainingObservation Step(int controlled_player, int action);
+  TrainingObservation Step(int action);
   int maximum_steps() const { return maximum_steps_; }
 
  private:

@@ -19,6 +19,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--steps-per-update", type=int, default=2048)
     parser.add_argument("--maximum-steps", type=int, default=3000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("checkpoints/ppo.pt")
     )
@@ -28,13 +29,20 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> None:
     arguments = parse_arguments()
+    device = torch.device(
+        "cuda"
+        if arguments.device == "auto" and torch.cuda.is_available()
+        else "cpu" if arguments.device == "auto" else arguments.device
+    )
     torch.manual_seed(arguments.seed)
-    environment = FootballEnv(arguments.maximum_steps)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(arguments.seed)
+    environment = FootballEnv(arguments.maximum_steps, arguments.seed)
     observation = environment.reset(arguments.seed)
     observation_size = encode(observation, arguments.maximum_steps).numel()
     policy = ActorCritic(
-        observation_size, environment.player_count, environment.action_count
-    )
+        observation_size, environment.action_count
+    ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=arguments.learning_rate)
 
     for iteration in range(1, arguments.updates + 1):
@@ -58,7 +66,6 @@ def main() -> None:
             {
                 "model": policy.state_dict(),
                 "observation_size": observation_size,
-                "player_count": environment.player_count,
                 "action_count": environment.action_count,
                 "maximum_steps": arguments.maximum_steps,
                 "updates": iteration,

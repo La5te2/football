@@ -8,15 +8,13 @@ import torch
 from torch import nn
 
 from .env import FootballEnv
-from .features import active_player_mask, encode
+from .features import encode
 from .network import ActorCritic
 
 
 @dataclass
 class Rollout:
     observations: torch.Tensor
-    player_masks: torch.Tensor
-    players: torch.Tensor
     actions: torch.Tensor
     old_log_probabilities: torch.Tensor
     advantages: torch.Tensor
@@ -31,9 +29,8 @@ def collect_rollout(
     gamma: float = 0.99,
     gae_lambda: float = 0.95,
 ) -> tuple[Rollout, dict, list[tuple[int, int]]]:
+    device = next(policy.parameters()).device
     observations = []
-    masks = []
-    players = []
     actions = []
     log_probabilities = []
     values = []
@@ -42,24 +39,14 @@ def collect_rollout(
     completed_games: list[tuple[int, int]] = []
 
     for _ in range(steps):
-        encoded = encode(observation, environment.maximum_steps)
-        mask = active_player_mask(observation)
+        encoded = encode(observation, environment.maximum_steps).to(device)
         with torch.no_grad():
-            player_distribution, action_distribution, value = (
-                policy.distributions(encoded, mask)
-            )
-            player = player_distribution.sample()
+            action_distribution, value = policy.distributions(encoded)
             action = action_distribution.sample()
-            log_probability = player_distribution.log_prob(
-                player
-            ) + action_distribution.log_prob(action)
+            log_probability = action_distribution.log_prob(action)
 
-        next_observation, reward, terminated, info = environment.step(
-            player.item(), action.item()
-        )
+        next_observation, reward, terminated, info = environment.step(action.item())
         observations.append(encoded)
-        masks.append(mask)
-        players.append(player)
         actions.append(action)
         log_probabilities.append(log_probability)
         values.append(value)
@@ -75,12 +62,11 @@ def collect_rollout(
         if terminated_flags[-1]:
             next_value = torch.tensor(0.0)
         else:
-            next_encoded = encode(observation, environment.maximum_steps)
-            next_mask = active_player_mask(observation)
-            _, _, next_value = policy.distributions(next_encoded, next_mask)
+            next_encoded = encode(observation, environment.maximum_steps).to(device)
+            _, next_value = policy.distributions(next_encoded)
 
-    advantages = torch.zeros(steps)
-    advantage = torch.tensor(0.0)
+    advantages = torch.zeros(steps, device=device)
+    advantage = torch.tensor(0.0, device=device)
     for index in reversed(range(steps)):
         continues = 0.0 if terminated_flags[index] else 1.0
         delta = (
@@ -96,8 +82,6 @@ def collect_rollout(
     return (
         Rollout(
             observations=torch.stack(observations),
-            player_masks=torch.stack(masks),
-            players=torch.stack(players),
             actions=torch.stack(actions),
             old_log_probabilities=torch.stack(log_probabilities),
             advantages=advantages,
@@ -126,16 +110,13 @@ def update(
     updates = 0
 
     for _ in range(epochs):
-        for indices in torch.randperm(sample_count).split(batch_size):
-            player_distribution, action_distribution, value = (
-                policy.distributions(
-                    rollout.observations[indices],
-                    rollout.player_masks[indices],
-                )
+        for indices in torch.randperm(
+            sample_count, device=rollout.observations.device
+        ).split(batch_size):
+            action_distribution, value = policy.distributions(
+                rollout.observations[indices]
             )
-            log_probability = player_distribution.log_prob(
-                rollout.players[indices]
-            ) + action_distribution.log_prob(rollout.actions[indices])
+            log_probability = action_distribution.log_prob(rollout.actions[indices])
             ratio = (log_probability - rollout.old_log_probabilities[indices]).exp()
             unclipped = ratio * advantages[indices]
             clipped = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * advantages[
@@ -143,9 +124,7 @@ def update(
             ]
             policy_loss = -torch.minimum(unclipped, clipped).mean()
             value_loss = nn.functional.mse_loss(value, rollout.returns[indices])
-            entropy = (
-                player_distribution.entropy() + action_distribution.entropy()
-            ).mean()
+            entropy = action_distribution.entropy().mean()
             loss = (
                 policy_loss
                 + value_coefficient * value_loss

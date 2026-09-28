@@ -71,23 +71,6 @@ Replay files are rendered by the separate replay executable:
 
 The replay executable plays every recorded match in order. The pause and playback-speed controls used during a live match also apply to replay rendering.
 
-## Training
-
-The `training/` module provides a headless single-agent environment and a minimal PyTorch PPO implementation. The policy controls the left team against the built-in AI by selecting one active player and one engine action every 100 ms.
-
-Build the native Python module with the Python interpreter active on `PATH`:
-
-```powershell
-.\training\build.bat
-```
-
-Start training and evaluate a saved checkpoint with:
-
-```powershell
-python -m training.train
-python -m training.evaluate checkpoints\ppo.pt --games 10
-```
-
 ## License
 
 See `LICENSE` and `engine/LICENSE`.
