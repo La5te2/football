@@ -35,9 +35,12 @@ enum EngineAction {
   kDelegate = 32,
 };
 
-constexpr int kPolicyActionCount = 52;
+// The checkpoint emits 52 logits(0~51), but TamakEri's original selector iterates
+// range(51), so policy index 51 never enters the candidate set.
+constexpr int kSelectablePolicyActionCount = 51;
+// Policy index 19 means delegation to the built-in AI and is explicitly excluded by
+// TamakEri's original legal-action mask.
 constexpr int kBuiltinAiPolicyAction = 19;
-constexpr int kUnusedPolicyAction = 51;
 constexpr int kDirectedKickBegin = 20;
 
 float Distance(float ax, float ay, float bx, float by) {
@@ -96,6 +99,7 @@ TamakEriAdapter::TamakEriAdapter(const std::string& model_path, int side,
 // Clears delayed actions and policy history for a new match.
 void TamakEriAdapter::Reset() {
   pending_action_ = -1;
+  pending_player_ = -1;
   last_action_ = 0;
   action_history_.clear();
 }
@@ -323,11 +327,8 @@ int TamakEriAdapter::ChooseAction(const Observation& observation,
   int best_action = 0;
   const auto values = logits.contiguous().view({-1});
   const auto accessor = values.accessor<float, 1>();
-  for (int action = 0; action < kPolicyActionCount; ++action) {
-    // TamakEri excludes policy index 19 and its original legal-action range
-    // stops at index 50 even though the network emits 52 logits.
-    bool legal = action != kBuiltinAiPolicyAction &&
-                 action != kUnusedPolicyAction;
+  for (int action = 0; action < kSelectablePolicyActionCount; ++action) {
+    bool legal = action != kBuiltinAiPolicyAction;
     const bool owns_ball = observation.ball_owned_team == 0;
     if (!owns_ball && ((action >= 9 && action <= 12) || action == 17 ||
                        action >= kDirectedKickBegin)) legal = false;
@@ -359,9 +360,34 @@ int TamakEriAdapter::Submit(int action) {
 }
 
 // Maps the engine-designated recipient into the common action array, updates
-// policy history, runs inference, and splits directed kicks across two steps.
+// policy history, runs inference, and keeps both halves of a directed kick on
+// the same player.
 GFootballModelDecision TamakEriAdapter::Decide(
     const GFootballModelObservation& state) {
+  auto decision = [this](int player, int action) {
+    GFootballModelDecision result{};
+    std::fill(std::begin(result.actions), std::end(result.actions), kDelegate);
+    if (player >= 0) result.actions[player] = Submit(action);
+    return result;
+  };
+  auto update_history = [this]() {
+    action_history_.push_back(last_action_);
+    while (action_history_.size() > 8) action_history_.pop_front();
+  };
+
+  if (pending_action_ >= 0) {
+    update_history();
+    const int action = pending_action_;
+    const int player = pending_player_;
+    pending_action_ = -1;
+    pending_player_ = -1;
+    if (player >= 0 && player < kGFootballPlayersPerTeam &&
+        state.teams[side_][player].is_active) {
+      return decision(player, action);
+    }
+    return decision(-1, kIdle);
+  }
+
   const int designated_player =
       state.team_state[side_].designated_possession_player;
   const int controlled_player =
@@ -369,23 +395,8 @@ GFootballModelDecision TamakEriAdapter::Decide(
               state.teams[side_][designated_player].is_active
           ? designated_player
           : -1;
-  auto decision = [this, controlled_player](int action) {
-    GFootballModelDecision result{};
-    std::fill(std::begin(result.actions), std::end(result.actions),
-              kDelegate);
-    if (controlled_player >= 0) {
-      result.actions[controlled_player] = Submit(action);
-    }
-    return result;
-  };
-  if (controlled_player < 0) return decision(kIdle);
-  action_history_.push_back(last_action_);
-  while (action_history_.size() > 8) action_history_.pop_front();
-  if (pending_action_ >= 0) {
-    const int pending = pending_action_;
-    pending_action_ = -1;
-    return decision(pending);
-  }
+  if (controlled_player < 0) return decision(-1, kIdle);
+  update_history();
   const Observation observation = Convert(state, controlled_player);
   torch::InferenceMode inference_mode;
   const at::Tensor logits = model_.forward(Features(observation)).toTensor();
@@ -394,7 +405,8 @@ GFootballModelDecision TamakEriAdapter::Decide(
     const int offset = action - kDirectedKickBegin;
     const int kick = offset / 8;
     pending_action_ = offset % 8 + 1;
-    return decision(9 + kick);
+    pending_player_ = controlled_player;
+    return decision(controlled_player, 9 + kick);
   }
-  return decision(action);
+  return decision(controlled_player, action);
 }

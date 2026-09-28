@@ -56,6 +56,7 @@ class TamakEriAdapter {
   int side_;
   int game_duration_;
   int pending_action_ = -1;
+  int pending_player_ = -1;
   int last_action_ = 0;
   std::deque<int> action_history_;
 };
