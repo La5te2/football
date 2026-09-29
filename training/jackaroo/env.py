@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
 import random
 from typing import Any, Sequence
-
-from .reward import football_potential, transition_reward
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,8 +17,15 @@ from . import _gfootball_env as native
 
 
 Observation = dict[str, Any]
-POTENTIAL_DISCOUNT = 1.0
-POTENTIAL_SCALE = 0.20
+
+
+def _goal_result(previous: Observation, current: Observation) -> int:
+    previous_difference = int(previous["goals"][0]) - int(previous["goals"][1])
+    current_difference = int(current["goals"][0]) - int(current["goals"][1])
+    result = current_difference - previous_difference
+    if result not in (-1, 0, 1):
+        raise RuntimeError("one engine step changed the score by more than one goal")
+    return result
 
 
 def _native_paths() -> tuple[Path, Path]:
@@ -42,17 +46,7 @@ class FootballEnv:
         self._next_left_team = True
         self._native = native.create(str(data), str(font), maximum_steps)
         self._observation: Observation | None = None
-        self._potential_scale = POTENTIAL_SCALE
-        self._potential_cache = 0.0
-        self._initial_scaled_potential = 0.0
-        self._potential_reward_total = 0.0
-
-    def set_potential_scale(self, scale: float) -> None:
-        if scale < 0.0:
-            raise ValueError("potential scale must be nonnegative")
-        self._potential_scale = scale
-        if self._observation is not None and self._observation["step"] == 0:
-            self._initial_scaled_potential = scale * self._potential_cache
+        self._segment_action_count = 0
 
     def reset(self, seed: int | None = None) -> Observation:
         if seed is None:
@@ -62,45 +56,39 @@ class FootballEnv:
         self._observation = native.reset(
             self._native, seed & 0xFFFFFFFF, left_team
         )
-        self._potential_cache = football_potential(self._observation)
-        self._initial_scaled_potential = self._potential_scale * self._potential_cache
-        self._potential_reward_total = 0.0
+        self._segment_action_count = 0
         return self._observation
 
     def step(self, action: int) -> tuple[Observation, float, bool, dict[str, Any]]:
+        """Advance one engine step and report segment and match boundaries."""
+
         if self._observation is None:
             raise RuntimeError("reset() must be called before step()")
         if not 0 <= action < self.action_count:
             raise ValueError(f"action must be in [0, {self.action_count - 1}]")
         previous = self._observation
+        action_applied = bool(previous["is_in_play"])
         decision = [native.ENGINE_ACTION_COUNT] * 11
         player = previous["team_state"][0]["designated_possession_player"]
         if 0 <= player < 11 and previous["teams"][0][player]["is_active"]:
             decision[player] = action
-        current, terminated = native.step(self._native, decision)
-        reward, self._potential_cache, components = transition_reward(
-            previous,
-            current,
-            terminated,
-            self._potential_cache,
-            self._potential_scale,
-            POTENTIAL_DISCOUNT,
-        )
-        if not math.isfinite(reward):
-            raise FloatingPointError("environment reward is not finite")
-        self._potential_reward_total += components["potential"]
+        current, match_done = native.step(self._native, decision)
+        if action_applied:
+            self._segment_action_count += 1
+        result = _goal_result(previous, current)
+        segment_done = result != 0 or match_done
         self._observation = current
         info = {
             "goals": current["goals"],
             "step": current["step"],
-            "reward_components": components,
-            "potential_telescoping_error": (
-                self._potential_reward_total + self._initial_scaled_potential
-                if terminated
-                else 0.0
-            ),
+            "segment_result": result if segment_done else None,
+            "segment_steps": self._segment_action_count if segment_done else 0,
+            "match_done": match_done,
+            "action_applied": action_applied,
         }
-        return current, reward, terminated, info
+        if segment_done:
+            self._segment_action_count = 0
+        return current, float(result), segment_done, info
 
 
 class VectorFootballEnv:
@@ -121,10 +109,7 @@ class VectorFootballEnv:
         self._next_left_team = [index % 2 == 0 for index in range(count)]
         self._native = native.create_batch(str(data), str(font), maximum_steps, count)
         self._observations: list[Observation] = []
-        self._potential_scale = POTENTIAL_SCALE
-        self._potential_cache = [0.0] * count
-        self._initial_scaled_potential = [0.0] * count
-        self._potential_reward_total = [0.0] * count
+        self._segment_action_counts = [0] * count
 
     def _seed(self) -> int:
         while True:
@@ -138,23 +123,12 @@ class VectorFootballEnv:
         self._next_left_team[index] = not left_team
         return left_team
 
-    def set_potential_scale(self, scale: float) -> None:
-        if scale < 0.0:
-            raise ValueError("potential scale must be nonnegative")
-        self._potential_scale = scale
-
-    def _initialize_reward(self, index: int, observation: Observation) -> None:
-        value = football_potential(observation)
-        self._potential_cache[index] = value
-        self._initial_scaled_potential[index] = self._potential_scale * value
-        self._potential_reward_total[index] = 0.0
-
     def reset(self) -> list[Observation]:
         seeds = [self._seed() for _ in range(self.count)]
         sides = [self._take_side(index) for index in range(self.count)]
         self._observations = list(native.reset_batch(self._native, seeds, sides))
         for index, observation in enumerate(self._observations):
-            self._initialize_reward(index, observation)
+            self._segment_action_counts[index] = 0
         return self._observations
 
     def reset_builtin(
@@ -171,6 +145,8 @@ class VectorFootballEnv:
                 list(sides),
             )
         )
+        for index, observation in enumerate(self._observations):
+            self._segment_action_counts[index] = 0
         return self._observations
 
     def reset_one(self, index: int) -> Observation:
@@ -180,7 +156,7 @@ class VectorFootballEnv:
             self._native, index, self._seed(), self._take_side(index)
         )
         self._observations[index] = observation
-        self._initialize_reward(index, observation)
+        self._segment_action_counts[index] = 0
         return observation
 
     def step_builtin(self) -> tuple[list[Observation], list[bool]]:
@@ -194,6 +170,8 @@ class VectorFootballEnv:
     def step(self, actions: Sequence[int]) -> tuple[
         list[Observation], list[float], list[bool], list[dict[str, Any]]
     ]:
+        """Advance every match and report next-goal segment boundaries."""
+
         if len(actions) != self.count:
             raise ValueError("one action is required per environment")
         decisions = []
@@ -210,34 +188,31 @@ class VectorFootballEnv:
 
         results = native.step_batch(self._native, decisions)
         observations = [result[0] for result in results]
-        terminated = [bool(result[1]) for result in results]
+        match_done = [bool(result[1]) for result in results]
         rewards: list[float] = []
+        segment_done: list[bool] = []
         infos: list[dict[str, Any]] = []
         for index, current in enumerate(observations):
-            reward, self._potential_cache[index], components = transition_reward(
-                previous_observations[index],
-                current,
-                terminated[index],
-                self._potential_cache[index],
-                self._potential_scale,
-                POTENTIAL_DISCOUNT,
-            )
-            if not math.isfinite(reward):
-                raise FloatingPointError("environment reward is not finite")
-            self._potential_reward_total[index] += components["potential"]
-            rewards.append(reward)
+            result = _goal_result(previous_observations[index], current)
+            action_applied = bool(previous_observations[index]["is_in_play"])
+            if action_applied:
+                self._segment_action_counts[index] += 1
+            ended = result != 0 or match_done[index]
+            rewards.append(float(result))
+            segment_done.append(ended)
             infos.append(
                 {
                     "goals": current["goals"],
                     "step": current["step"],
-                    "reward_components": components,
-                    "potential_telescoping_error": (
-                        self._potential_reward_total[index]
-                        + self._initial_scaled_potential[index]
-                        if terminated[index]
-                        else 0.0
+                    "segment_result": result if ended else None,
+                    "segment_steps": (
+                        self._segment_action_counts[index] if ended else 0
                     ),
+                    "match_done": match_done[index],
+                    "action_applied": action_applied,
                 }
             )
+            if ended:
+                self._segment_action_counts[index] = 0
         self._observations = observations
-        return observations, rewards, terminated, infos
+        return observations, rewards, segment_done, infos

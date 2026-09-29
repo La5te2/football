@@ -26,9 +26,7 @@ class Rollout:
     old_log_probabilities: torch.Tensor
     advantages: torch.Tensor
     returns: torch.Tensor
-    task_reward_total: float
-    potential_reward_total: float
-    telescoping_error_total: float
+    reward_total: float
 
 
 def collect_vector_rollout(
@@ -37,12 +35,17 @@ def collect_vector_rollout(
     observations: list[dict],
     steps: int,
     gamma: float = 1.0,
-    gae_lambda: float = 0.95,
+    gae_lambda: float = 1.0,
     policy_histories: list[list[TensorFrame]] | None = None,
     history_length: int = 4,
     progress: Callable[[str], None] | None = None,
-) -> tuple[Rollout, list[dict], list[tuple[int, int]]]:
-    """Collect concurrent trajectories and preserve each environment's GAE."""
+) -> tuple[
+    Rollout,
+    list[dict],
+    list[tuple[int, int]],
+    list[tuple[int, int]],
+]:
+    """Collect on-policy transitions with next-goal episode boundaries."""
 
     if steps <= 0:
         raise ValueError("rollout steps must be positive")
@@ -64,24 +67,28 @@ def collect_vector_rollout(
     log_probability_parts = [[] for _ in range(environment.count)]
     value_parts = [[] for _ in range(environment.count)]
     reward_parts = [[] for _ in range(environment.count)]
-    terminated_parts = [[] for _ in range(environment.count)]
-    task_reward_total = 0.0
-    potential_reward_total = 0.0
-    telescoping_error_total = 0.0
-    completed_games: list[tuple[int, int]] = []
+    segment_done_parts = [[] for _ in range(environment.count)]
+    reward_total = 0.0
+    completed_segments: list[tuple[int, int]] = []
+    completed_matches: list[tuple[int, int]] = []
+    boundary_seen = [False] * environment.count
     transitions = 0
     report_interval = max(environment.count, min(512, max(steps // 8, 1)))
     next_report = report_interval
 
-    while transitions < steps:
+    while transitions < steps or not all(boundary_seen):
+        inference_histories = []
         for index, observation in enumerate(observations):
-            policy_histories[index].append(
-                tensorize(observation, environment.maximum_steps)
-            )
-            if len(policy_histories[index]) > history_length:
-                del policy_histories[index][:-history_length]
+            frame = tensorize(observation, environment.maximum_steps)
+            if observation["is_in_play"]:
+                policy_histories[index].append(frame)
+                if len(policy_histories[index]) > history_length:
+                    del policy_histories[index][:-history_length]
+                inference_histories.append(policy_histories[index])
+            else:
+                inference_histories.append(policy_histories[index] + [frame])
         inputs = batch_tensor_histories(
-            policy_histories, history_length, device
+            inference_histories, history_length, device
         )
         encoded, own, opponent, context, anchors, opponent_anchors = inputs
         with torch.inference_mode():
@@ -89,39 +96,46 @@ def collect_vector_rollout(
             action = distribution.sample()
             log_probability = distribution.log_prob(action)
 
-        next_observations, rewards, terminated, infos = environment.step(
+        next_observations, rewards, segment_done, infos = environment.step(
             action.tolist()
         )
         for index in range(environment.count):
             reward = rewards[index]
             if not math.isfinite(reward):
                 raise FloatingPointError("rollout reward is not finite")
-            encoded_parts[index].append(encoded[index])
-            own_parts[index].append(own[index])
-            opponent_parts[index].append(opponent[index])
-            context_parts[index].append(context[index])
-            anchor_parts[index].append(anchors[index])
-            opponent_anchor_parts[index].append(opponent_anchors[index])
-            action_parts[index].append(action[index])
-            log_probability_parts[index].append(log_probability[index])
-            value_parts[index].append(value[index])
-            reward_parts[index].append(reward)
-            terminated_parts[index].append(terminated[index])
-            task_reward_total += infos[index]["reward_components"]["task"]
-            potential_reward_total += infos[index]["reward_components"]["potential"]
-            telescoping_error_total += abs(infos[index]["potential_telescoping_error"])
-            if terminated[index]:
-                completed_games.append(tuple(infos[index]["goals"]))
+            if infos[index]["action_applied"]:
+                encoded_parts[index].append(encoded[index])
+                own_parts[index].append(own[index])
+                opponent_parts[index].append(opponent[index])
+                context_parts[index].append(context[index])
+                anchor_parts[index].append(anchors[index])
+                opponent_anchor_parts[index].append(opponent_anchors[index])
+                action_parts[index].append(action[index])
+                log_probability_parts[index].append(log_probability[index])
+                value_parts[index].append(value[index])
+                reward_parts[index].append(reward)
+                segment_done_parts[index].append(segment_done[index])
+                reward_total += reward
+                transitions += 1
+            if segment_done[index]:
+                result = infos[index]["segment_result"]
+                if result not in (-1, 0, 1):
+                    raise RuntimeError("completed segment has no WDL result")
+                completed_segments.append((int(result), infos[index]["segment_steps"]))
+                boundary_seen[index] = True
                 policy_histories[index].clear()
-                next_observations[index] = environment.reset_one(index)
+                if infos[index]["match_done"]:
+                    completed_matches.append(tuple(infos[index]["goals"]))
+                    next_observations[index] = environment.reset_one(index)
         observations = next_observations
-        transitions += environment.count
         if progress is not None and transitions >= next_report:
             match_steps = [observation["step"] for observation in observations]
             progress(
                 f"steps={transitions} target={steps} "
                 f"match_step={min(match_steps)}-{max(match_steps)} "
-                f"games={len(completed_games)}"
+                f"segments={len(completed_segments)} "
+                f"matches={len(completed_matches)} "
+                f"boundaries={sum(boundary_seen)}/{environment.count}"
             )
             next_report += report_interval
 
@@ -145,7 +159,7 @@ def collect_vector_rollout(
         advantage = torch.tensor(0.0, device=device)
         next_value = next_values[environment_index]
         for index in reversed(range(len(reward_parts[environment_index]))):
-            continues = 0.0 if terminated_parts[environment_index][index] else 1.0
+            continues = 0.0 if segment_done_parts[environment_index][index] else 1.0
             delta = (
                 reward_parts[environment_index][index]
                 + gamma * next_value * continues
@@ -182,12 +196,11 @@ def collect_vector_rollout(
             old_log_probabilities=stack(log_probability_parts),
             advantages=advantages,
             returns=advantages + values,
-            task_reward_total=task_reward_total,
-            potential_reward_total=potential_reward_total,
-            telescoping_error_total=telescoping_error_total,
+            reward_total=reward_total,
         ),
         observations,
-        completed_games,
+        completed_segments,
+        completed_matches,
     )
 
 

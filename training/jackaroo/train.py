@@ -9,11 +9,11 @@ from typing import Any
 
 import torch
 
-from .attention import batch_tensor_histories, tensorize
-from .env import FootballEnv, POTENTIAL_DISCOUNT, VectorFootballEnv
+from .env import FootballEnv, VectorFootballEnv
+from .evaluate import evaluate_policy
 from .features import encode
 from .imitation import collect_demonstrations, pretrain_policy
-from .network import ActorCritic
+from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
 from .ppo import collect_vector_rollout, update
 
 
@@ -28,6 +28,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--environments", type=int, default=8)
     parser.add_argument("--maximum-steps", type=int, default=3000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--ppo-batch-size", type=int, default=256)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("runs/jackaroo.pt")
@@ -36,11 +38,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--history-length", type=int, default=4)
-    parser.add_argument("--imitation-games", type=int, default=8)
-    parser.add_argument("--imitation-epochs", type=int, default=3)
+    parser.add_argument("--imitation-games", type=int, default=128)
+    parser.add_argument("--imitation-epochs", type=int, default=2)
     parser.add_argument("--imitation-batch-size", type=int, default=256)
     parser.add_argument("--imitation-learning-rate", type=float, default=3e-4)
-    parser.add_argument("--potential-scale", type=float, default=0.20)
     parser.add_argument("--evaluation-interval", type=int, default=50)
     parser.add_argument("--evaluation-games", type=int, default=2)
     return parser.parse_args()
@@ -68,6 +69,8 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
         "history_length",
         "imitation_batch_size",
         "evaluation_interval",
+        "ppo_epochs",
+        "ppo_batch_size",
     ):
         if getattr(arguments, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
@@ -76,50 +79,6 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
             raise ValueError(f"{name.replace('_', '-')} must be nonnegative")
     if arguments.learning_rate <= 0.0 or arguments.imitation_learning_rate <= 0.0:
         raise ValueError("learning rates must be positive")
-    if arguments.potential_scale < 0.0:
-        raise ValueError("potential-scale must be nonnegative")
-
-
-def _evaluate(
-    policy: ActorCritic,
-    maximum_steps: int,
-    history_length: int,
-    games: int,
-    seed: int,
-) -> dict[str, float]:
-    if games == 0:
-        return {"wins": 0.0, "draws": 0.0, "losses": 0.0, "goal_difference": 0.0}
-    device = next(policy.parameters()).device
-    environment = FootballEnv(maximum_steps, seed)
-    wins = draws = losses = goal_difference = 0
-    policy.eval()
-    for game in range(games):
-        observation = environment.reset((seed + game // 2) & 0xFFFFFFFF)
-        history = []
-        terminated = False
-        info: dict[str, Any] = {"goals": (0, 0)}
-        while not terminated:
-            history.append(tensorize(observation, maximum_steps))
-            if len(history) > history_length:
-                del history[:-history_length]
-            with torch.inference_mode():
-                logits, _ = policy(
-                    *batch_tensor_histories([history], history_length, device)
-                )
-            observation, _, terminated, info = environment.step(
-                logits[0].argmax().item()
-            )
-        own, opponent = info["goals"]
-        wins += own > opponent
-        draws += own == opponent
-        losses += own < opponent
-        goal_difference += own - opponent
-    return {
-        "wins": float(wins),
-        "draws": float(draws),
-        "losses": float(losses),
-        "goal_difference": goal_difference / games,
-    }
 
 
 def main() -> None:
@@ -147,20 +106,31 @@ def main() -> None:
     observation = bootstrap_environment.reset(arguments.seed)
     frame_size = encode(observation, arguments.maximum_steps).numel()
     policy = ActorCritic(frame_size, bootstrap_environment.action_count).to(device)
-    imitation_metrics = {"loss": 0.0, "accuracy": 0.0, "samples": 0.0}
+    parameter_count = sum(parameter.numel() for parameter in policy.parameters())
+    _status(
+        f"policy architecture={POLICY_ARCHITECTURE} parameters={parameter_count}"
+    )
+    imitation_metrics = {
+        "loss": 0.0,
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "accuracy": 0.0,
+        "samples": 0.0,
+        "segments": 0.0,
+    }
     start_iteration = 1
 
     if arguments.resume is not None:
         _status(f"resume loading={arguments.resume}")
         checkpoint = torch.load(arguments.resume, map_location=device, weights_only=True)
         expected = {
+            "architecture": POLICY_ARCHITECTURE,
+            "parameter_count": parameter_count,
             "frame_size": frame_size,
             "action_count": bootstrap_environment.action_count,
             "maximum_steps": arguments.maximum_steps,
             "history_length": arguments.history_length,
-            "reward": "goal-result-fixed-potential",
-            "potential_scale": arguments.potential_scale,
-            "potential_discount": POTENTIAL_DISCOUNT,
+            "objective": POLICY_OBJECTIVE,
         }
         for name, value in expected.items():
             if checkpoint.get(name) != value:
@@ -198,6 +168,7 @@ def main() -> None:
         del episodes
         _status(
             f"imitation complete samples={int(imitation_metrics['samples'])} "
+            f"segments={int(imitation_metrics['segments'])} "
             f"accuracy={imitation_metrics['accuracy']:.4f}"
         )
         del imitation_environment
@@ -209,14 +180,13 @@ def main() -> None:
     environment = VectorFootballEnv(
         arguments.environments, arguments.maximum_steps, arguments.seed + 1
     )
-    environment.set_potential_scale(arguments.potential_scale)
     observations = environment.reset()
     policy_histories = [[] for _ in range(arguments.environments)]
     _status(f"vector-environment count={arguments.environments} ready")
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
         _status(f"update={iteration} rollout start target_steps={arguments.steps_per_update}")
-        rollout, observations, games = collect_vector_rollout(
+        rollout, observations, segments, matches = collect_vector_rollout(
             environment,
             policy,
             observations,
@@ -230,21 +200,30 @@ def main() -> None:
             policy,
             optimizer,
             rollout,
+            epochs=arguments.ppo_epochs,
+            batch_size=arguments.ppo_batch_size,
             progress=lambda message: _status(f"update={iteration} ppo {message}"),
         )
         action_counts = torch.bincount(
             rollout.actions.detach().cpu(), minlength=environment.action_count
         ).float()
+        segment_wins = sum(result == 1 for result, _ in segments)
+        segment_draws = sum(result == 0 for result, _ in segments)
+        segment_losses = sum(result == -1 for result, _ in segments)
         diagnostics = {
             "action_distribution": (action_counts / action_counts.sum()).tolist(),
-            "task_reward_total": rollout.task_reward_total,
-            "potential_reward_total": rollout.potential_reward_total,
-            "potential_telescoping_error_total": rollout.telescoping_error_total,
+            "reward_total": rollout.reward_total,
+            "segment_wins": segment_wins,
+            "segment_draws": segment_draws,
+            "segment_losses": segment_losses,
+            "mean_segment_steps": (
+                sum(length for _, length in segments) / len(segments)
+            ),
         }
         evaluation: dict[str, float] = {}
         if arguments.evaluation_games and iteration % arguments.evaluation_interval == 0:
             _status(f"update={iteration} evaluation start")
-            evaluation = _evaluate(
+            evaluation = evaluate_policy(
                 policy,
                 arguments.maximum_steps,
                 arguments.history_length,
@@ -253,28 +232,36 @@ def main() -> None:
             )
             _status(
                 f"update={iteration} evaluation "
-                f"wdl={int(evaluation['wins'])}/"
+                f"matches={int(evaluation['wins'])}/"
                 f"{int(evaluation['draws'])}/{int(evaluation['losses'])} "
-                f"goal_difference={evaluation['goal_difference']:.3f}"
+                f"goal_difference={evaluation['goal_difference']:.3f} "
+                f"segments={int(evaluation['segment_wins'])}/"
+                f"{int(evaluation['segment_draws'])}/"
+                f"{int(evaluation['segment_losses'])} "
+                f"segment_steps={evaluation['mean_segment_steps']:.1f}"
             )
-        scores = " ".join(f"{left}:{right}" for left, right in games) or "-"
+        scores = " ".join(f"{left}:{right}" for left, right in matches) or "-"
         print(
-            f"update={iteration} games={scores} policy={losses['policy']:.4f} "
+            f"update={iteration} matches={scores} "
+            f"segments={segment_wins}/{segment_draws}/{segment_losses} "
+            f"segment_steps={diagnostics['mean_segment_steps']:.1f} "
+            f"policy={losses['policy']:.4f} "
             f"value={losses['value']:.4f} entropy={losses['entropy']:.4f} "
-            f"task={rollout.task_reward_total:.3f} "
-            f"shaping={rollout.potential_reward_total:.3f}",
+            f"reward={rollout.reward_total:.3f}",
             flush=True,
         )
         checkpoint = {
+            "architecture": POLICY_ARCHITECTURE,
+            "parameter_count": parameter_count,
             "model": policy.state_dict(),
             "frame_size": frame_size,
             "action_count": environment.action_count,
             "maximum_steps": arguments.maximum_steps,
             "history_length": arguments.history_length,
             "environments": arguments.environments,
-            "potential_scale": arguments.potential_scale,
-            "potential_discount": POTENTIAL_DISCOUNT,
-            "reward": "goal-result-fixed-potential",
+            "ppo_epochs": arguments.ppo_epochs,
+            "ppo_batch_size": arguments.ppo_batch_size,
+            "objective": POLICY_OBJECTIVE,
             "feature_scaling": "fixed",
             "updates": iteration,
             "imitation": imitation_metrics,
@@ -288,7 +275,8 @@ def main() -> None:
             log_path,
             {
                 "update": iteration,
-                "games": games,
+                "segments": segments,
+                "matches": matches,
                 "ppo": losses,
                 "diagnostics": diagnostics,
                 "evaluation": evaluation,

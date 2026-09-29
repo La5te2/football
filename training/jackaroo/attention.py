@@ -1,4 +1,4 @@
-"""Entity encoding and relational attention for the Jackaroo policy."""
+"""Tensor conversion and entity Transformer for the Jackaroo policy."""
 
 from __future__ import annotations
 
@@ -11,12 +11,15 @@ from .features import encode
 
 
 Observation = dict[str, Any]
-PLAYER_FEATURES = 24
+BASE_PLAYER_FEATURES = 24
+RELATIVE_PLAYER_FEATURES = 6
+PLAYER_FEATURES = BASE_PLAYER_FEATURES + RELATIVE_PLAYER_FEATURES
+PLAYER_ACTIVE_INDEX = BASE_PLAYER_FEATURES - 2
 CONTEXT_FEATURES = 66
 BALL_FEATURES = 9
 MATCH_FEATURES = CONTEXT_FEATURES - BALL_FEATURES
-ENTITY_WIDTH = 64
-RELATION_WIDTH = 64
+ENTITY_WIDTH = 128
+ENTITY_COUNT = 24
 HistoryItem = TypeVar("HistoryItem")
 
 
@@ -31,8 +34,12 @@ class TensorFrame(NamedTuple):
     opponent_anchor: torch.Tensor
 
 
-def player_features(player: dict[str, Any]) -> list[float]:
-    """Convert one public player record into a relational feature vector."""
+def player_features(
+    player: dict[str, Any],
+    ball_position: Sequence[float],
+    controlled_position: Sequence[float],
+) -> list[float]:
+    """Encode one player and its position relative to the ball and controller."""
 
     values: list[float] = []
     values.extend(player["position"])
@@ -53,6 +60,16 @@ def player_features(player: dict[str, Any]) -> list[float]:
             float(player["has_card"]),
             float(player["is_active"]),
             float(player["touch_pending"]),
+        )
+    )
+    values.extend(
+        coordinate - ball_coordinate
+        for coordinate, ball_coordinate in zip(player["position"], ball_position)
+    )
+    values.extend(
+        coordinate - controlled_coordinate
+        for coordinate, controlled_coordinate in zip(
+            player["position"], controlled_position
         )
     )
     return values
@@ -118,14 +135,26 @@ def tensorize(observation: Observation, maximum_steps: int) -> TensorFrame:
             if observation["ball_owned_team"] == 1
             else 0
         )
+    ball_position = observation["ball_position"]
+    controlled_position = (
+        observation["teams"][0][designated]["position"]
+        if 0 <= designated < 11
+        else ball_position
+    )
     return TensorFrame(
         encode(observation, maximum_steps),
         torch.tensor(
-            [player_features(player) for player in observation["teams"][0]],
+            [
+                player_features(player, ball_position, controlled_position)
+                for player in observation["teams"][0]
+            ],
             dtype=torch.float32,
         ),
         torch.tensor(
-            [player_features(player) for player in observation["teams"][1]],
+            [
+                player_features(player, ball_position, controlled_position)
+                for player in observation["teams"][1]
+            ],
             dtype=torch.float32,
         ),
         torch.tensor(
@@ -164,69 +193,85 @@ def batch_tensor_histories(
     return tuple(batches)
 
 
-class RelationEncoder(nn.Module):
-    """Relate every player to opponents, teammates, ball, and match context."""
+class EntityTransformerBlock(nn.Module):
+    """Apply self-attention and a residual feed-forward update to entity tokens."""
 
-    output_width = RELATION_WIDTH * 3
-
-    def __init__(self, entity_width: int = ENTITY_WIDTH) -> None:
+    def __init__(self, width: int, heads: int, feedforward_width: int) -> None:
         super().__init__()
-        self.entity = nn.Sequential(
-            nn.Linear(PLAYER_FEATURES, entity_width),
-            nn.Tanh(),
-            nn.Linear(entity_width, entity_width),
-            nn.Tanh(),
+        self.attention_norm = nn.LayerNorm(width)
+        self.attention = nn.MultiheadAttention(
+            width, heads, dropout=0.0, batch_first=True
         )
-        self.ball = nn.Sequential(
-            nn.Linear(BALL_FEATURES, entity_width),
-            nn.Tanh(),
+        self.feedforward_norm = nn.LayerNorm(width)
+        self.feedforward = nn.Sequential(
+            nn.Linear(width, feedforward_width),
+            nn.GELU(),
+            nn.Linear(feedforward_width, width),
         )
-        self.match = nn.Sequential(
-            nn.Linear(MATCH_FEATURES, entity_width),
-            nn.Tanh(),
-        )
-        self.context = nn.Sequential(
-            nn.Linear(entity_width * 2, entity_width),
-            nn.Tanh(),
-        )
-        self.query_opponent = nn.Linear(entity_width * 2, entity_width, bias=False)
-        self.key_opponent = nn.Linear(entity_width, entity_width, bias=False)
-        self.value_opponent = nn.Linear(entity_width, entity_width, bias=False)
-        self.relation = nn.Sequential(
-            nn.Linear(entity_width * 3, RELATION_WIDTH),
-            nn.Tanh(),
-        )
-        self.offense_query = nn.Linear(RELATION_WIDTH, RELATION_WIDTH, bias=False)
-        self.offense_key = nn.Linear(RELATION_WIDTH, RELATION_WIDTH, bias=False)
-        self.defense_query = nn.Linear(RELATION_WIDTH, RELATION_WIDTH, bias=False)
-        self.defense_key = nn.Linear(RELATION_WIDTH, RELATION_WIDTH, bias=False)
-        self.offense_value = nn.Linear(RELATION_WIDTH, RELATION_WIDTH, bias=False)
-        self.defense_value = nn.Linear(RELATION_WIDTH, RELATION_WIDTH, bias=False)
 
-    def _relations(
-        self,
-        primary: torch.Tensor,
-        secondary: torch.Tensor,
-        context: torch.Tensor,
+    def forward(
+        self, tokens: torch.Tensor, padding_mask: torch.Tensor
     ) -> torch.Tensor:
-        query = self.query_opponent(
-            torch.cat((primary, context.unsqueeze(1).expand_as(primary)), dim=-1)
+        normalized = self.attention_norm(tokens)
+        attended, _ = self.attention(
+            normalized,
+            normalized,
+            normalized,
+            key_padding_mask=padding_mask,
+            need_weights=False,
         )
-        keys = self.key_opponent(secondary)
-        scores = torch.einsum("bid,bjd->bij", query, keys) / keys.shape[-1] ** 0.5
-        active = secondary[..., -2] > 0.5
-        active = torch.where(
-            active.any(dim=-1, keepdim=True), active, torch.ones_like(active)
+        tokens = tokens + attended
+        return tokens + self.feedforward(self.feedforward_norm(tokens))
+
+
+class EntityTransformer(nn.Module):
+    """Model interactions among both teams, the ball, and match context."""
+
+    def __init__(
+        self,
+        width: int = ENTITY_WIDTH,
+        heads: int = 8,
+        layers: int = 3,
+        feedforward_width: int = 512,
+    ) -> None:
+        super().__init__()
+        self.output_width = width * 5
+        self.player_encoder = nn.Sequential(
+            nn.LayerNorm(PLAYER_FEATURES),
+            nn.Linear(PLAYER_FEATURES, width),
+            nn.GELU(),
+            nn.Linear(width, width),
         )
-        scores = scores.masked_fill(~active.unsqueeze(1), -torch.inf)
-        weights = torch.softmax(scores, dim=-1)
-        opponent_context = torch.einsum(
-            "bij,bjd->bid", weights, self.value_opponent(secondary)
+        self.ball_encoder = nn.Sequential(
+            nn.LayerNorm(BALL_FEATURES),
+            nn.Linear(BALL_FEATURES, width),
+            nn.GELU(),
+            nn.Linear(width, width),
         )
-        expanded_context = context.unsqueeze(1).expand_as(primary)
-        return self.relation(
-            torch.cat((primary, opponent_context, expanded_context), dim=-1)
+        self.match_encoder = nn.Sequential(
+            nn.LayerNorm(MATCH_FEATURES),
+            nn.Linear(MATCH_FEATURES, width),
+            nn.GELU(),
+            nn.Linear(width, width),
         )
+        self.type_embedding = nn.Embedding(4, width)
+        self.slot_embedding = nn.Embedding(ENTITY_COUNT, width)
+        self.own_anchor_embedding = nn.Parameter(torch.zeros(width))
+        self.opponent_anchor_embedding = nn.Parameter(torch.zeros(width))
+        self.blocks = nn.ModuleList(
+            EntityTransformerBlock(width, heads, feedforward_width)
+            for _ in range(layers)
+        )
+        self.output_norm = nn.LayerNorm(width)
+        self.register_buffer(
+            "type_indices",
+            torch.tensor([0] * 11 + [1] * 11 + [2, 3], dtype=torch.long),
+        )
+
+    @staticmethod
+    def _masked_mean(tokens: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        weights = active.to(tokens.dtype).unsqueeze(-1)
+        return (tokens * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
 
     def forward(
         self,
@@ -235,67 +280,61 @@ class RelationEncoder(nn.Module):
         context: torch.Tensor,
         anchor_indices: torch.Tensor,
         opponent_anchor_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         shape = own.shape[:-2]
         own_flat = own.reshape(-1, 11, PLAYER_FEATURES)
         opponent_flat = opponent.reshape(-1, 11, PLAYER_FEATURES)
+        players = torch.cat((own_flat, opponent_flat), dim=1)
         context_flat = context.reshape(-1, CONTEXT_FEATURES)
-        anchors_flat = anchor_indices.reshape(-1)
-        opponent_anchors_flat = opponent_anchor_indices.reshape(-1)
-        own_encoded = self.entity(own_flat)
-        opponent_encoded = self.entity(opponent_flat)
-        context_encoded = self.context(
-            torch.cat(
-                (
-                    self.ball(context_flat[:, :BALL_FEATURES]),
-                    self.match(context_flat[:, BALL_FEATURES:]),
-                ),
-                dim=-1,
-            )
-        )
-        own_relation = self._relations(own_encoded, opponent_encoded, context_encoded)
-        opponent_relation = self._relations(
-            opponent_encoded, own_encoded, context_encoded
-        )
-        rows = torch.arange(own_flat.shape[0], device=own.device)
-        anchor = own_relation[rows, anchors_flat]
-        opponent_anchor = opponent_relation[rows, opponent_anchors_flat]
+        anchors_flat = anchor_indices.reshape(-1).clamp(0, 10)
+        opponent_anchors_flat = opponent_anchor_indices.reshape(-1).clamp(0, 10)
 
-        offense_logits = torch.einsum(
-            "bd,bid->bi",
-            self.offense_query(anchor),
-            self.offense_key(own_relation),
-        ) / RELATION_WIDTH ** 0.5
-        defense_logits = torch.einsum(
-            "bd,bid->bi",
-            self.defense_query(opponent_anchor),
-            self.defense_key(opponent_relation),
-        ) / RELATION_WIDTH ** 0.5
-        own_active = own_flat[..., -2] > 0.5
-        opponent_active = opponent_flat[..., -2] > 0.5
-        own_active = torch.where(
-            own_active.any(dim=-1, keepdim=True),
-            own_active,
-            torch.ones_like(own_active),
+        tokens = torch.cat(
+            (
+                self.player_encoder(players),
+                self.ball_encoder(
+                    context_flat[:, :BALL_FEATURES]
+                ).unsqueeze(1),
+                self.match_encoder(
+                    context_flat[:, BALL_FEATURES:]
+                ).unsqueeze(1),
+            ),
+            dim=1,
         )
-        opponent_active = torch.where(
-            opponent_active.any(dim=-1, keepdim=True),
-            opponent_active,
-            torch.ones_like(opponent_active),
+        tokens = (
+            tokens
+            + self.type_embedding(self.type_indices).unsqueeze(0)
+            + self.slot_embedding.weight.unsqueeze(0)
         )
-        offense_logits = offense_logits.masked_fill(~own_active, -torch.inf)
-        defense_logits = defense_logits.masked_fill(~opponent_active, -torch.inf)
-        offense_weights = torch.softmax(offense_logits, dim=-1)
-        defense_weights = torch.softmax(defense_logits, dim=-1)
-        teammate_context = torch.einsum(
-            "bi,bid->bd", offense_weights, self.offense_value(own_relation)
+        own_markers = nn.functional.one_hot(
+            anchors_flat, num_classes=ENTITY_COUNT
+        ).to(tokens.dtype)
+        opponent_markers = nn.functional.one_hot(
+            opponent_anchors_flat + 11, num_classes=ENTITY_COUNT
+        ).to(tokens.dtype)
+        tokens = (
+            tokens
+            + own_markers.unsqueeze(-1) * self.own_anchor_embedding
+            + opponent_markers.unsqueeze(-1) * self.opponent_anchor_embedding
         )
-        opponent_context = torch.einsum(
-            "bi,bid->bd", defense_weights, self.defense_value(opponent_relation)
+
+        active_players = players[..., PLAYER_ACTIVE_INDEX] > 0.5
+        context_active = torch.ones(
+            active_players.shape[0], 2, dtype=torch.bool, device=players.device
         )
-        relation = torch.cat((anchor, teammate_context, opponent_context), dim=-1)
-        return (
-            relation.reshape(*shape, self.output_width),
-            offense_logits.reshape(*shape, 11),
-            defense_logits.reshape(*shape, 11),
+        padding_mask = ~torch.cat((active_players, context_active), dim=1)
+        for block in self.blocks:
+            tokens = block(tokens, padding_mask)
+        tokens = self.output_norm(tokens)
+
+        rows = torch.arange(tokens.shape[0], device=tokens.device)
+        controlled = tokens[rows, anchors_flat]
+        own_team = self._masked_mean(tokens[:, :11], active_players[:, :11])
+        opponent_team = self._masked_mean(
+            tokens[:, 11:22], active_players[:, 11:22]
         )
+        output = torch.cat(
+            (controlled, own_team, opponent_team, tokens[:, 22], tokens[:, 23]),
+            dim=-1,
+        )
+        return output.reshape(*shape, self.output_width)

@@ -28,6 +28,7 @@ ACTION_SHOT = 12
 ACTION_SLIDING = 14
 ACTION_PRESSURE = 15
 Demonstration = tuple[TensorFrame, int]
+DemonstrationEpisode = tuple[list[Demonstration], float]
 
 
 def _direction_action(x: float, y: float) -> int:
@@ -78,15 +79,16 @@ def project_builtin_action(previous: Observation, current: Observation) -> int:
 
 def collect_demonstrations(
     environment: VectorFootballEnv,
-    games: int,
+    matches: int,
     seed: int,
     progress: Callable[[str], None] | None = None,
-) -> list[list[Demonstration]]:
-    """Collect encoded built-in actions without retaining observation dictionaries."""
+) -> list[DemonstrationEpisode]:
+    """Collect built-in actions and split matches at every goal boundary."""
 
-    episodes: list[list[Demonstration]] = []
-    while len(episodes) < games:
-        first = len(episodes)
+    episodes: list[DemonstrationEpisode] = []
+    completed_matches = 0
+    while completed_matches < matches:
+        first = completed_matches
         seeds = [
             (seed + first + index) & 0xFFFFFFFF
             for index in range(environment.count)
@@ -94,65 +96,89 @@ def collect_demonstrations(
         sides = [(first + index) % 2 == 0 for index in range(environment.count)]
         if progress is not None:
             progress(
-                f"batch={first + 1}-{min(first + environment.count, games)}/"
-                f"{games} start"
+                f"batch={first + 1}-{min(first + environment.count, matches)}/"
+                f"{matches} start"
             )
         observations = environment.reset_builtin(seeds, sides)
-        demonstrations: list[list[Demonstration]] = [
+        current_segments: list[list[Demonstration]] = [
             [] for _ in range(environment.count)
         ]
-        terminated = [False] * environment.count
+        match_segments: list[list[DemonstrationEpisode]] = [
+            [] for _ in range(environment.count)
+        ]
+        match_done = [False] * environment.count
         next_progress_step = 500
-        while not all(terminated):
+        while not all(match_done):
             previous_observations = observations
-            observations, current_terminated = environment.step_builtin()
+            observations, current_match_done = environment.step_builtin()
             for index, observation in enumerate(observations):
-                if not terminated[index]:
-                    demonstrations[index].append(
-                        (
-                            tensorize(
-                                previous_observations[index],
-                                environment.maximum_steps,
-                            ),
-                            project_builtin_action(
-                                previous_observations[index], observation
-                            ),
+                if not match_done[index]:
+                    previous = previous_observations[index]
+                    if previous["is_in_play"]:
+                        current_segments[index].append(
+                            (
+                                tensorize(
+                                    previous,
+                                    environment.maximum_steps,
+                                ),
+                                project_builtin_action(previous, observation),
+                            )
                         )
+                    previous_difference = int(previous["goals"][0]) - int(
+                        previous["goals"][1]
                     )
-                terminated[index] = terminated[index] or current_terminated[index]
+                    current_difference = int(observation["goals"][0]) - int(
+                        observation["goals"][1]
+                    )
+                    result = current_difference - previous_difference
+                    if result not in (-1, 0, 1):
+                        raise RuntimeError(
+                            "one built-in step changed the score by more than one goal"
+                        )
+                    if result:
+                        match_segments[index].append(
+                            (current_segments[index], float(result))
+                        )
+                        current_segments[index] = []
+                    if current_match_done[index] and current_segments[index]:
+                        match_segments[index].append((current_segments[index], 0.0))
+                        current_segments[index] = []
+                match_done[index] = match_done[index] or current_match_done[index]
             minimum_step = min(observation["step"] for observation in observations)
             if progress is not None and minimum_step >= next_progress_step:
                 progress(
-                    f"batch={first + 1}-{min(first + environment.count, games)}/"
-                    f"{games} step={minimum_step}/{environment.maximum_steps}"
+                    f"batch={first + 1}-{min(first + environment.count, matches)}/"
+                    f"{matches} step={minimum_step}/{environment.maximum_steps}"
                 )
                 next_progress_step += 500
-        remaining = games - len(episodes)
-        for index, demonstration in enumerate(demonstrations[:remaining]):
-            episodes.append(demonstration)
+        remaining = matches - completed_matches
+        for index, segments in enumerate(match_segments[:remaining]):
+            episodes.extend(segments)
+            completed_matches += 1
             if progress is not None:
                 goals = observations[index]["goals"]
                 progress(
-                    f"game={len(episodes)}/{games} complete "
-                    f"score={goals[0]}:{goals[1]}"
+                    f"match={completed_matches}/{matches} complete "
+                    f"score={goals[0]}:{goals[1]} segments={len(segments)}"
                 )
     return episodes
 
 
 def pretrain_policy(
     policy: ActorCritic,
-    episodes: Sequence[Sequence[Demonstration]],
+    episodes: Sequence[DemonstrationEpisode],
     history_length: int,
     device: torch.device,
     epochs: int = 3,
     batch_size: int = 256,
     learning_rate: float = 3e-4,
+    value_coefficient: float = 0.5,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
-    """Fit the actor to projected built-in actions before PPO optimization."""
+    """Initialize the actor and next-goal critic from built-in episodes."""
 
-    samples: list[tuple[list[TensorFrame], int]] = []
-    for episode in episodes:
+    samples: list[tuple[list[TensorFrame], int, float]] = []
+    for episode, outcome in episodes:
         for index, (_, action) in enumerate(episode):
             history = [
                 frame
@@ -160,9 +186,16 @@ def pretrain_policy(
                     max(0, index - history_length + 1):index + 1
                 ]
             ]
-            samples.append((history, action))
+            samples.append((history, action, outcome))
     if not samples or epochs <= 0:
-        return {"loss": 0.0, "accuracy": 0.0, "samples": float(len(samples))}
+        return {
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "accuracy": 0.0,
+            "samples": float(len(samples)),
+            "segments": float(len(episodes)),
+        }
 
     encoded_parts = []
     own_parts = []
@@ -190,17 +223,19 @@ def pretrain_policy(
             inputs,
         ):
             destination.append(tensor)
-    cached_inputs = tuple(
-        torch.cat(parts, dim=0)
-        for parts in (
-            encoded_parts,
-            own_parts,
-            opponent_parts,
-            context_parts,
-            anchor_parts,
-            opponent_anchor_parts,
-        )
-    )
+    cached_inputs_list = []
+    for parts in (
+        encoded_parts,
+        own_parts,
+        opponent_parts,
+        context_parts,
+        anchor_parts,
+        opponent_anchor_parts,
+    ):
+        cached_inputs_list.append(torch.cat(parts, dim=0))
+        parts.clear()
+    cached_inputs = tuple(cached_inputs_list)
+    value_targets = torch.tensor([sample[2] for sample in samples], dtype=torch.float32)
     counts = torch.bincount(targets, minlength=policy.action_head.out_features).float()
     class_weights = torch.zeros_like(counts)
     observed = counts > 0
@@ -212,11 +247,15 @@ def pretrain_policy(
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
     final_loss = 0.0
+    final_policy_loss = 0.0
+    final_value_loss = 0.0
     final_correct = 0
     final_count = 0
     for epoch in range(1, epochs + 1):
         permutation = torch.randperm(sample_count)
         total_loss = 0.0
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
         total_correct = 0
         total_count = 0
         policy.train()
@@ -224,30 +263,41 @@ def pretrain_policy(
             indices = permutation[start:start + batch_size]
             batch_inputs = tuple(tensor[indices].to(device) for tensor in cached_inputs)
             batch_targets = targets[indices].to(device)
-            logits, _ = policy(*batch_inputs)
-            loss = nn.functional.cross_entropy(
+            batch_values = value_targets[indices].to(device)
+            logits, values = policy(*batch_inputs)
+            policy_loss = nn.functional.cross_entropy(
                 logits, batch_targets, weight=class_weights
             )
+            value_loss = nn.functional.mse_loss(values, batch_values)
+            loss = policy_loss + value_coefficient * value_loss
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
             optimizer.step()
             count = batch_targets.numel()
             total_loss += loss.item() * count
+            total_policy_loss += policy_loss.item() * count
+            total_value_loss += value_loss.item() * count
             total_correct += (
                 logits.argmax(dim=-1) == batch_targets
             ).sum().item()
             total_count += count
         final_loss = total_loss / total_count
+        final_policy_loss = total_policy_loss / total_count
+        final_value_loss = total_value_loss / total_count
         final_correct = total_correct
         final_count = total_count
         if progress is not None:
             progress(
-                f"epoch={epoch}/{epochs} loss={final_loss:.4f} "
+                f"epoch={epoch}/{epochs} policy={final_policy_loss:.4f} "
+                f"value={final_value_loss:.4f} "
                 f"accuracy={total_correct / total_count:.4f}"
             )
     return {
         "loss": final_loss,
+        "policy_loss": final_policy_loss,
+        "value_loss": final_value_loss,
         "accuracy": final_correct / final_count,
         "samples": float(sample_count),
+        "segments": float(len(episodes)),
     }

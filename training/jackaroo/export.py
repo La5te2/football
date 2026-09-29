@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from .attention import CONTEXT_FEATURES, PLAYER_FEATURES
-from .network import ActorCritic
+from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -21,6 +21,16 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     arguments = parse_arguments()
     checkpoint = torch.load(arguments.checkpoint, map_location="cpu", weights_only=True)
+    if checkpoint.get("architecture") != POLICY_ARCHITECTURE:
+        raise ValueError(
+            f"checkpoint architecture={checkpoint.get('architecture')!r} does not "
+            f"match {POLICY_ARCHITECTURE!r}"
+        )
+    if checkpoint.get("objective") != POLICY_OBJECTIVE:
+        raise ValueError(
+            f"checkpoint objective={checkpoint.get('objective')!r} does not match "
+            f"{POLICY_OBJECTIVE!r}"
+        )
     required = ("model", "frame_size", "action_count")
     missing = [name for name in required if name not in checkpoint]
     if missing:
