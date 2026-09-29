@@ -293,25 +293,38 @@ def fit_potential(
     oda_weight: float = 0.25,
     symmetry_weight: float = 0.1,
     history_length: int = 4,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
     """Fit outcome, confidence-weighted ODA, and mirror-consistency losses."""
 
     if isinstance(model, PotentialEnsemble):
-        results = [
-            fit_potential(
-                member,
-                optimizer,
-                episodes,
-                maximum_steps,
-                device,
-                epochs,
-                batch_size,
-                oda_weight,
-                symmetry_weight,
-                history_length,
+        results = []
+        member_count = len(model.members)
+        for member_index, member in enumerate(model.members, start=1):
+            if progress is not None:
+                progress(f"member={member_index}/{member_count} start")
+            member_progress = (
+                lambda message, index=member_index: progress(
+                    f"member={index}/{member_count} {message}"
+                )
+                if progress is not None
+                else None
             )
-            for member in model.members
-        ]
+            results.append(
+                fit_potential(
+                    member,
+                    optimizer,
+                    episodes,
+                    maximum_steps,
+                    device,
+                    epochs,
+                    batch_size,
+                    oda_weight,
+                    symmetry_weight,
+                    history_length,
+                    member_progress,
+                )
+            )
         return {
             name: sum(result[name] for result in results) / len(results)
             for name in results[0]
@@ -330,9 +343,11 @@ def fit_potential(
     weights = torch.tensor(
         [1.0 / stratum_counts[record.stratum] for record in records]
     )
-    for _ in range(epochs):
+    batch_count = (len(records) + batch_size - 1) // batch_size
+    report_interval = max(1, batch_count // 4)
+    for epoch in range(1, epochs + 1):
         order = torch.multinomial(weights, len(records), replacement=True)
-        for indices in order.split(batch_size):
+        for batch_index, indices in enumerate(order.split(batch_size), start=1):
             selected = [records[index] for index in indices.tolist()]
             original_histories = [
                 _record_history(record, history_length) for record in selected
@@ -407,6 +422,12 @@ def fit_potential(
             totals["oda"] += oda_loss.item()
             totals["symmetry"] += symmetry_loss.item()
             updates += 1
+            if progress is not None and (
+                batch_index % report_interval == 0 or batch_index == batch_count
+            ):
+                progress(
+                    f"epoch={epoch}/{epochs} batch={batch_index}/{batch_count}"
+                )
     return {name: value / max(updates, 1) for name, value in totals.items()}
 
 

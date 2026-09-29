@@ -90,17 +90,25 @@ class FootballEnv:
         return self._observation
 
     def collect_builtin_episode(
-        self, seed: int
+        self,
+        seed: int,
+        progress: Callable[[int, int], None] | None = None,
     ) -> tuple[list[Observation], tuple[int, int]]:
         """Collect one complete all-delegated match for potential pretraining."""
 
         observation = self.reset(seed)
         observations = [observation]
+        next_progress_step = 500
         while True:
             decision = [self.action_count] * 11
             observation, terminated = native.step(self._native, decision)
             observations.append(observation)
             self._observation = observation
+            reached_progress_step = observation["step"] >= next_progress_step
+            if progress is not None and (reached_progress_step or terminated):
+                progress(observation["step"], self.maximum_steps)
+            if reached_progress_step:
+                next_progress_step = observation["step"] + 500
             if terminated:
                 return observations, tuple(observation["goals"])
 

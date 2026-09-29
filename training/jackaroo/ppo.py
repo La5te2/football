@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Callable
 
 import torch
 from torch import nn
@@ -41,6 +42,7 @@ def collect_rollout(
     episode_history: list[dict] | None = None,
     policy_history: list[dict] | None = None,
     history_length: int = 4,
+    progress: Callable[[str], None] | None = None,
 ) -> tuple[Rollout, dict, list[tuple[int, int]], list[Episode]]:
     if steps <= 0:
         raise ValueError("rollout steps must be positive")
@@ -65,6 +67,7 @@ def collect_rollout(
         episode_history = []
     if policy_history is None:
         policy_history = []
+    report_interval = max(1, min(500, steps // 8))
 
     while len(rewards) < steps or episode_history:
         episode_history.append(observation)
@@ -103,6 +106,14 @@ def collect_rollout(
         potential_reward_total += info["reward_components"]["potential"]
         telescoping_error_total += abs(info["potential_telescoping_error"])
         terminated_flags.append(terminated)
+        if progress is not None and (
+            len(rewards) % report_interval == 0 or terminated
+        ):
+            phase = "collecting" if len(rewards) < steps else "finishing-match"
+            progress(
+                f"phase={phase} steps={len(rewards)} target={steps} "
+                f"match_step={next_observation['step']}"
+            )
 
         observation = next_observation
         if terminated:
@@ -179,6 +190,7 @@ def update(
     clip_ratio: float = 0.2,
     value_coefficient: float = 0.5,
     entropy_coefficient: float = 0.01,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
     advantages = (rollout.advantages - rollout.advantages.mean()) / (
         rollout.advantages.std(unbiased=False) + 1e-8
@@ -187,7 +199,7 @@ def update(
     totals = {"policy": 0.0, "value": 0.0, "entropy": 0.0}
     updates = 0
 
-    for _ in range(epochs):
+    for epoch in range(1, epochs + 1):
         for indices in torch.randperm(
             sample_count, device=rollout.encoded.device
         ).split(batch_size):
@@ -227,5 +239,7 @@ def update(
             totals["value"] += value_loss.item()
             totals["entropy"] += entropy.item()
             updates += 1
+        if progress is not None:
+            progress(f"epoch={epoch}/{epochs}")
 
     return {name: value / updates for name, value in totals.items()}

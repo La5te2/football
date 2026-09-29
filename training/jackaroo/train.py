@@ -25,6 +25,12 @@ from .potential import (
 from .ppo import collect_rollout, update
 
 
+def _status(message: str) -> None:
+    """Write one immediately visible progress line for terminals and nohup logs."""
+
+    print(f"status={message}", flush=True)
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--updates", type=int, default=1000)
@@ -129,6 +135,10 @@ def main() -> None:
     torch.manual_seed(arguments.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(arguments.seed)
+    _status(
+        f"startup device={device.type} group={arguments.training_group} "
+        f"updates={arguments.updates} maximum_steps={arguments.maximum_steps}"
+    )
     environment = FootballEnv(arguments.maximum_steps, arguments.seed)
     potential_scale = arguments.potential_scale
     if arguments.training_group == "terminal":
@@ -154,6 +164,7 @@ def main() -> None:
 
     start_iteration = 1
     if arguments.resume is not None:
+        _status(f"resume loading={arguments.resume}")
         checkpoint = torch.load(arguments.resume, map_location=device, weights_only=True)
         expected = {
             "frame_size": frame_size,
@@ -200,20 +211,39 @@ def main() -> None:
         if len(potential_dataset) != int(checkpoint.get("potential_updates", -1)):
             raise ValueError("checkpoint and trajectory dataset are inconsistent")
         start_iteration = int(checkpoint.get("updates", 0)) + 1
+        _status(
+            f"resume ready start_update={start_iteration} "
+            f"episodes={len(potential_dataset)}"
+        )
     else:
         bootstrap_games = (
             0 if arguments.training_group == "terminal"
             else arguments.potential_bootstrap_games
         )
         for game in range(bootstrap_games):
+            game_seed = arguments.seed + game
+            _status(
+                f"bootstrap game={game + 1}/{bootstrap_games} seed={game_seed} start"
+            )
             observations, goals = environment.collect_builtin_episode(
-                arguments.seed + game
+                game_seed,
+                progress=lambda step, maximum, index=game + 1: _status(
+                    f"bootstrap game={index}/{bootstrap_games} "
+                    f"step={step}/{maximum}"
+                ),
             )
             left_goals, right_goals = goals
             outcome = 0 if left_goals > right_goals else 1 if left_goals == right_goals else 2
             bootstrap_episodes.append(Episode(observations, outcome))
+            _status(
+                f"bootstrap game={game + 1}/{bootstrap_games} "
+                f"complete score={left_goals}:{right_goals}"
+            )
         potential_dataset.add(bootstrap_episodes, base=True)
     if arguments.resume is None and bootstrap_episodes:
+        _status(
+            f"initial-potential episodes={len(potential_dataset.train)} fitting"
+        )
         potential_metrics = fit_potential(
             potential_model,
             potential_optimizer,
@@ -223,6 +253,7 @@ def main() -> None:
             epochs=arguments.potential_epochs,
             oda_weight=0.0 if arguments.training_group == "learned" else 0.25,
             history_length=arguments.history_length,
+            progress=lambda message: _status(f"initial-potential {message}"),
         )
         if arguments.training_group == "oda":
             policy.initialize_oda(potential_model.averaged_oda())
@@ -232,6 +263,7 @@ def main() -> None:
                 snapshot, arguments.maximum_steps, arguments.history_length
             )
         )
+        _status("initial-potential validation")
         validation_metrics = evaluate_potential(
             potential_model,
             potential_dataset.validation,
@@ -242,6 +274,7 @@ def main() -> None:
         potential_metrics.update(
             {f"validation_{name}": value for name, value in validation_metrics.items()}
         )
+        _status("initial-potential test")
         test_metrics = evaluate_potential(
             potential_model,
             potential_dataset.test,
@@ -252,9 +285,13 @@ def main() -> None:
         potential_metrics.update(
             {f"test_{name}": value for name, value in test_metrics.items()}
         )
+        _status("initial-potential complete")
     observation = environment.reset(arguments.seed + len(bootstrap_episodes))
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
+        _status(
+            f"update={iteration} rollout start target_steps={arguments.steps_per_update}"
+        )
         rollout, observation, games, episodes = collect_rollout(
             environment,
             policy,
@@ -263,8 +300,20 @@ def main() -> None:
             episode_history=episode_history,
             policy_history=policy_history,
             history_length=arguments.history_length,
+            progress=lambda message: _status(f"update={iteration} rollout {message}"),
         )
-        losses = update(policy, optimizer, rollout)
+        _status(
+            f"update={iteration} rollout complete steps={rollout.actions.numel()} "
+            f"games={len(games)}"
+        )
+        _status(f"update={iteration} ppo start")
+        losses = update(
+            policy,
+            optimizer,
+            rollout,
+            progress=lambda message: _status(f"update={iteration} ppo {message}"),
+        )
+        _status(f"update={iteration} ppo complete")
         action_counts = torch.bincount(
             rollout.actions.detach().cpu(), minlength=environment.action_count
         ).float()
@@ -294,6 +343,7 @@ def main() -> None:
             and potential_dataset.validation
             and iteration % arguments.potential_refresh_interval == 0
         ):
+            _status(f"update={iteration} potential previous-validation")
             previous_model = copy.deepcopy(potential_model).eval()
             previous_potential = copy.deepcopy(potential_model.state_dict())
             previous_validation = evaluate_potential(
@@ -312,7 +362,11 @@ def main() -> None:
                 epochs=arguments.potential_epochs,
                 oda_weight=0.0 if arguments.training_group == "learned" else 0.25,
                 history_length=arguments.history_length,
+                progress=lambda message: _status(
+                    f"update={iteration} potential {message}"
+                ),
             )
+            _status(f"update={iteration} potential candidate-validation")
             validation_metrics = evaluate_potential(
                 potential_model,
                 potential_dataset.validation,
@@ -354,6 +408,7 @@ def main() -> None:
                     device,
                     history_length=arguments.history_length,
                 )
+                _status(f"update={iteration} potential refresh=accepted")
             else:
                 potential_model.load_state_dict(previous_potential)
                 validation_metrics = previous_validation
@@ -361,6 +416,10 @@ def main() -> None:
                     arguments.minimum_potential_scale, potential_scale * 0.5
                 )
                 environment.set_potential_scale(potential_scale)
+                _status(
+                    f"update={iteration} potential refresh=rejected "
+                    f"scale={potential_scale:.4f}"
+                )
             potential_optimizer = torch.optim.Adam(
                 potential_model.parameters(), lr=arguments.potential_learning_rate
             )
@@ -431,9 +490,11 @@ def main() -> None:
             "optimizer": optimizer.state_dict(),
             "potential_optimizer": potential_optimizer.state_dict(),
         }
+        _status(f"update={iteration} checkpoint saving")
         _atomic_torch_save(potential_dataset.state_dict(), output_dataset)
         _atomic_torch_save(checkpoint, arguments.checkpoint)
         _append_log(log_path, log_record)
+        _status(f"update={iteration} checkpoint saved={arguments.checkpoint}")
 
 
 if __name__ == "__main__":
