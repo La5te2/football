@@ -34,7 +34,7 @@ On Linux, start the formal background run from the repository root:
 bash training/jackaroo/run.sh
 ```
 
-The script selects the system C++ runtime, validates the native environment, collects 128 built-in AI matches for two behavior-cloning epochs, collects complete decisive next-goal episodes in parallel until each PPO update contains at least 8192 retained transitions, reuses them for four PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
+The script selects the system C++ runtime, validates the native environment, uses every valid action from 128 complete built-in AI matches for two behavior-cloning epochs, collects complete decisive next-goal episodes in parallel until each PPO update contains at least 8192 retained transitions, reuses them for four PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
 
 Running the Python module directly collects 128 built-in AI matches, performs two behavior-cloning epochs, then starts PPO with eight concurrent native environments. The default checkpoint is `runs/jackaroo.pt` and the compact per-update log is `runs/jackaroo.pt.jsonl`.
 
@@ -44,7 +44,7 @@ python -m training.jackaroo.train --imitation-games 128 --imitation-epochs 2 --u
 
 Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue PPO from a checkpoint. Resume restores policy and optimizer state and skips behavior cloning.
 
-Each training episode starts at kickoff and ends when either team scores the next goal or the underlying match reaches full time. Scoring and conceding produce $+1$ and $-1$ respectively, while every non-terminal transition has zero reward. A full-time episode without a goal remains in evaluation statistics but is excluded from behavior cloning and PPO because it has no observed next-goal winner. Goals divide one continuous match into several training episodes while preserving its score, remaining time, random state, and team state. PPO assigns the completed episode's undiscounted result to every action in that episode and trains only on complete episodes.
+Behavior cloning uses every valid action in each complete teacher match and does not divide demonstrations at goals. PPO episodes start at kickoff and end when either team scores the next goal or the underlying match reaches full time. Scoring and conceding produce $+1$ and $-1$ respectively, while every non-terminal transition has zero reward. A full-time PPO episode without a goal remains in evaluation statistics but is excluded from PPO because it has no observed next-goal winner. Goals divide one continuous match into several PPO episodes while preserving its score, remaining time, random state, and team state. PPO assigns the completed episode's undiscounted result to every action in that episode and trains only on complete decisive episodes.
 
 ## Evaluation
 

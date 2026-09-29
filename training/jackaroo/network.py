@@ -54,7 +54,7 @@ class ActorCritic(nn.Module):
         self.action_head = nn.Linear(HEAD_WIDTH, action_count)
         self.value_head = nn.Linear(HEAD_WIDTH, 1)
 
-    def forward(
+    def _encode_history(
         self,
         encoded: torch.Tensor,
         own: torch.Tensor,
@@ -62,7 +62,7 @@ class ActorCritic(nn.Module):
         context: torch.Tensor,
         anchor_indices: torch.Tensor,
         opponent_anchor_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         entities = self.entities(
             own,
             opponent,
@@ -74,7 +74,46 @@ class ActorCritic(nn.Module):
             torch.cat((self.global_encoder(encoded), entities), dim=-1)
         )
         temporal, _ = self.temporal(sequence)
-        hidden = temporal[:, -1]
+        return temporal[:, -1]
+
+    def action_logits(
+        self,
+        encoded: torch.Tensor,
+        own: torch.Tensor,
+        opponent: torch.Tensor,
+        context: torch.Tensor,
+        anchor_indices: torch.Tensor,
+        opponent_anchor_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the Actor output without evaluating the Critic head."""
+
+        hidden = self._encode_history(
+            encoded,
+            own,
+            opponent,
+            context,
+            anchor_indices,
+            opponent_anchor_indices,
+        )
+        return self.action_head(self.actor_encoder(hidden))
+
+    def forward(
+        self,
+        encoded: torch.Tensor,
+        own: torch.Tensor,
+        opponent: torch.Tensor,
+        context: torch.Tensor,
+        anchor_indices: torch.Tensor,
+        opponent_anchor_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden = self._encode_history(
+            encoded,
+            own,
+            opponent,
+            context,
+            anchor_indices,
+            opponent_anchor_indices,
+        )
         return (
             self.action_head(self.actor_encoder(hidden)),
             self.value_head(self.critic_encoder(hidden)).squeeze(-1),

@@ -116,10 +116,9 @@ def main() -> None:
     imitation_metrics = {
         "loss": 0.0,
         "policy_loss": 0.0,
-        "value_loss": 0.0,
         "accuracy": 0.0,
         "samples": 0.0,
-        "segments": 0.0,
+        "matches": 0.0,
     }
     baseline_evaluation: dict[str, float] = {}
     start_iteration = 1
@@ -153,7 +152,7 @@ def main() -> None:
             arguments.maximum_steps,
             arguments.seed,
         )
-        episodes = collect_demonstrations(
+        demonstrations = collect_demonstrations(
             imitation_environment,
             arguments.imitation_games,
             arguments.seed,
@@ -162,7 +161,7 @@ def main() -> None:
         _status("imitation optimize start")
         imitation_metrics = pretrain_policy(
             policy,
-            episodes,
+            demonstrations,
             arguments.history_length,
             device,
             epochs=arguments.imitation_epochs,
@@ -170,10 +169,10 @@ def main() -> None:
             learning_rate=arguments.imitation_learning_rate,
             progress=lambda message: _status(f"imitation {message}"),
         )
-        del episodes
+        del demonstrations
         _status(
             f"imitation complete samples={int(imitation_metrics['samples'])} "
-            f"segments={int(imitation_metrics['segments'])} "
+            f"matches={int(imitation_metrics['matches'])} "
             f"accuracy={imitation_metrics['accuracy']:.4f}"
         )
         del imitation_environment
