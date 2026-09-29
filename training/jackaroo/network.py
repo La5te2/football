@@ -1,4 +1,4 @@
-"""ODA-initialized actor-critic network for the Jackaroo policy."""
+"""Recurrent actor-critic network for the Jackaroo policy."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 
-from .attention import ODAEncoder
+from .attention import RelationEncoder
 
 
 class ActorCritic(nn.Module):
@@ -14,21 +14,16 @@ class ActorCritic(nn.Module):
 
     def __init__(self, frame_size: int, action_count: int) -> None:
         super().__init__()
-        self.oda = ODAEncoder()
+        self.relation = RelationEncoder()
         self.global_encoder = nn.Sequential(
             nn.Linear(frame_size, 128),
             nn.Tanh(),
         )
         self.temporal = nn.GRU(
-            128 + self.oda.output_width, 256, batch_first=True
+            128 + self.relation.output_width, 256, batch_first=True
         )
         self.action_head = nn.Linear(256, action_count)
         self.value_head = nn.Linear(256, 1)
-
-    def initialize_oda(self, source: ODAEncoder) -> None:
-        """Initialize the policy relation encoder from pretrained ODA weights."""
-
-        self.oda.load_state_dict(source.state_dict())
 
     def forward(
         self,
@@ -39,7 +34,7 @@ class ActorCritic(nn.Module):
         anchor_indices: torch.Tensor,
         opponent_anchor_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        relation, _, _ = self.oda(
+        relation, _, _ = self.relation(
             own,
             opponent,
             context,

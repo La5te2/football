@@ -45,7 +45,7 @@ def main() -> None:
         torch.zeros(1, history_length, dtype=torch.long),
         torch.zeros(1, history_length, dtype=torch.long),
     )
-    with torch.no_grad():
+    with torch.inference_mode():
         exported = torch.jit.trace(policy, example, strict=True)
         expected = policy(*example)
         actual = exported(*example)

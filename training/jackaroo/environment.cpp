@@ -102,9 +102,26 @@ TrainingEnvironment::~TrainingEnvironment() = default;
 // Restarts the complete match and advances through the noninteractive startup.
 TrainingObservation TrainingEnvironment::Reset(std::uint32_t seed,
                                                bool left_team) {
+  return ResetMatch(seed, left_team, true);
+}
+
+// Starts a pure built-in-AI match while preserving the requested observation
+// perspective for behavior-cloning data collection.
+TrainingObservation TrainingEnvironment::ResetBuiltin(std::uint32_t seed,
+                                                       bool left_team) {
+  return ResetMatch(seed, left_team, false);
+}
+
+TrainingObservation TrainingEnvironment::ResetMatch(std::uint32_t seed,
+                                                     bool left_team,
+                                                     bool external_team) {
   left_team_ = left_team;
-  scenario_->left_agents = left_team ? kGFootballPlayersPerTeam : 0;
-  scenario_->right_agents = left_team ? 0 : kGFootballPlayersPerTeam;
+  scenario_->left_agents = external_team && left_team
+      ? kGFootballPlayersPerTeam
+      : 0;
+  scenario_->right_agents = external_team && !left_team
+      ? kGFootballPlayersPerTeam
+      : 0;
   scenario_->game_engine_random_seed = seed;
   environment_->reset(*scenario_, false);
   while (true) {

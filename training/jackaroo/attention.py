@@ -1,8 +1,8 @@
-"""ODA entity encoding and relational attention for Jackaroo."""
+"""Entity encoding and relational attention for the Jackaroo policy."""
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence, TypeVar
 
 import torch
 from torch import nn
@@ -17,6 +17,18 @@ BALL_FEATURES = 9
 MATCH_FEATURES = CONTEXT_FEATURES - BALL_FEATURES
 ENTITY_WIDTH = 64
 RELATION_WIDTH = 64
+HistoryItem = TypeVar("HistoryItem")
+
+
+class TensorFrame(NamedTuple):
+    """One public observation encoded once in CPU tensors."""
+
+    encoded: torch.Tensor
+    own: torch.Tensor
+    opponent: torch.Tensor
+    context: torch.Tensor
+    anchor: torch.Tensor
+    opponent_anchor: torch.Tensor
 
 
 def player_features(player: dict[str, Any]) -> list[float]:
@@ -79,8 +91,8 @@ def context_features(observation: Observation, maximum_steps: int) -> list[float
 
 
 def padded_history(
-    observations: Sequence[Observation], length: int
-) -> list[Observation]:
+    observations: Sequence[HistoryItem], length: int
+) -> list[HistoryItem]:
     """Return one fixed causal history, padding with its first observation."""
 
     if not observations:
@@ -91,9 +103,44 @@ def padded_history(
     return [window[0]] * (length - len(window)) + window
 
 
-def batch_histories(
-    histories: Sequence[Sequence[Observation]],
-    maximum_steps: int,
+def tensorize(observation: Observation, maximum_steps: int) -> TensorFrame:
+    """Convert one public observation to reusable CPU tensors."""
+
+    designated = observation["team_state"][0]["designated_possession_player"]
+    if not 0 <= designated < 11:
+        designated = observation["ball_owned_player"]
+    opponent_designated = observation["team_state"][1][
+        "designated_possession_player"
+    ]
+    if not 0 <= opponent_designated < 11:
+        opponent_designated = (
+            observation["ball_owned_player"]
+            if observation["ball_owned_team"] == 1
+            else 0
+        )
+    return TensorFrame(
+        encode(observation, maximum_steps),
+        torch.tensor(
+            [player_features(player) for player in observation["teams"][0]],
+            dtype=torch.float32,
+        ),
+        torch.tensor(
+            [player_features(player) for player in observation["teams"][1]],
+            dtype=torch.float32,
+        ),
+        torch.tensor(
+            context_features(observation, maximum_steps), dtype=torch.float32
+        ),
+        torch.tensor(designated if 0 <= designated < 11 else 0, dtype=torch.long),
+        torch.tensor(
+            opponent_designated if 0 <= opponent_designated < 11 else 0,
+            dtype=torch.long,
+        ),
+    )
+
+
+def batch_tensor_histories(
+    histories: Sequence[Sequence[TensorFrame]],
     history_length: int,
     device: torch.device,
 ) -> tuple[
@@ -104,72 +151,20 @@ def batch_histories(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Build global, entity, context, and anchor tensors for causal histories."""
+    """Stack cached tensor frames into one device batch."""
 
     windows = [padded_history(history, history_length) for history in histories]
-    encoded = torch.stack(
-        [torch.stack([encode(observation, maximum_steps) for observation in window])
-         for window in windows]
-    ).to(device)
-    own = torch.tensor(
-        [[[player_features(player) for player in observation["teams"][0]]
-          for observation in window] for window in windows],
-        dtype=torch.float32,
-        device=device,
-    )
-    opponent = torch.tensor(
-        [[[player_features(player) for player in observation["teams"][1]]
-          for observation in window] for window in windows],
-        dtype=torch.float32,
-        device=device,
-    )
-    context = torch.tensor(
-        [[context_features(observation, maximum_steps) for observation in window]
-         for window in windows],
-        dtype=torch.float32,
-        device=device,
-    )
-    anchors = []
-    opponent_anchors = []
-    for window in windows:
-        window_anchors = []
-        window_opponent_anchors = []
-        for observation in window:
-            designated = observation["team_state"][0][
-                "designated_possession_player"
-            ]
-            if not 0 <= designated < 11:
-                designated = observation["ball_owned_player"]
-            window_anchors.append(designated if 0 <= designated < 11 else 0)
-            opponent_designated = observation["team_state"][1][
-                "designated_possession_player"
-            ]
-            if not 0 <= opponent_designated < 11:
-                opponent_designated = (
-                    observation["ball_owned_player"]
-                    if observation["ball_owned_team"] == 1
-                    else 0
-                )
-            window_opponent_anchors.append(
-                opponent_designated if 0 <= opponent_designated < 11 else 0
-            )
-        anchors.append(window_anchors)
-        opponent_anchors.append(window_opponent_anchors)
-    anchor_indices = torch.tensor(anchors, dtype=torch.long, device=device)
-    opponent_anchor_indices = torch.tensor(
-        opponent_anchors, dtype=torch.long, device=device
-    )
-    return (
-        encoded,
-        own,
-        opponent,
-        context,
-        anchor_indices,
-        opponent_anchor_indices,
-    )
+    batches = []
+    for field in range(len(TensorFrame._fields)):
+        batches.append(
+            torch.stack(
+                [torch.stack([frame[field] for frame in window]) for window in windows]
+            ).to(device, non_blocking=True)
+        )
+    return tuple(batches)
 
 
-class ODAEncoder(nn.Module):
+class RelationEncoder(nn.Module):
     """Relate every player to opponents, teammates, ball, and match context."""
 
     output_width = RELATION_WIDTH * 3

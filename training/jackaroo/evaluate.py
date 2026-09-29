@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from .env import FootballEnv
-from .attention import batch_histories
+from .attention import batch_tensor_histories, tensorize
 from .network import ActorCritic
 
 
@@ -46,11 +46,13 @@ def main() -> None:
         terminated = False
         info = {"goals": (0, 0)}
         while not terminated:
-            history.append(observation)
-            inputs = batch_histories(
-                [history], environment.maximum_steps, history_length, device
+            history.append(tensorize(observation, environment.maximum_steps))
+            if len(history) > history_length:
+                del history[:-history_length]
+            inputs = batch_tensor_histories(
+                [history], history_length, device
             )
-            with torch.no_grad():
+            with torch.inference_mode():
                 action_logits, _ = policy(*inputs)
                 action = action_logits[0].argmax().item()
             observation, _, terminated, info = environment.step(action)
