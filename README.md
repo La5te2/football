@@ -21,10 +21,22 @@ $env:VCPKG_ROOT = '<path-to-vcpkg>'
 
 CMake obtains the LibTorch package from the `python` interpreter on `PATH` by default. Set `GFOOTBALL_TORCH_ROOT` when using a standalone LibTorch distribution.
 
-On Linux, install the equivalent C++ dependencies and run:
+On Ubuntu or Debian, install the compiler, CMake, Python development files, and native engine dependencies from the system package manager:
 
 ```bash
-./build.sh
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config python3-dev \
+  libboost-filesystem-dev libboost-system-dev libboost-thread-dev \
+  libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libsdl2-gfx-dev \
+  libgl1-mesa-dev libegl1-mesa-dev
+```
+
+Activate the Python environment containing PyTorch, then build the native runtime and the Jackaroo training module:
+
+```bash
+python -c "import torch; print(torch.__version__)"
+bash build.sh
+bash training/jackaroo/build.sh
 ```
 
 Build intermediates remain under `.local/build/`. The runnable files and engine assets are copied to `bin/`.
