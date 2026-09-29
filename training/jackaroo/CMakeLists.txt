@@ -14,6 +14,8 @@ endif()
 
 project(gfootball_training LANGUAGES C CXX)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -63,7 +65,7 @@ else()
     WITH_SOABI)
 endif()
 
-target_link_libraries(_gfootball_env PRIVATE gfootball_engine)
+target_link_libraries(_gfootball_env PRIVATE gfootball_engine Threads::Threads)
 target_include_directories(_gfootball_env PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/../../engine/src"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../engine/src/cmake")

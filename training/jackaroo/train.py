@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 from .dataset import Episode, EpisodeDataset, ODA_HORIZON, ODA_STABLE_STEPS
-from .env import FootballEnv
+from .env import FootballEnv, VectorFootballEnv
 from .features import encode
 from .network import ActorCritic
 from .potential import (
@@ -19,10 +19,10 @@ from .potential import (
     PotentialEnsemble,
     evaluate_potential,
     fit_potential,
-    make_potential_function,
+    make_batched_potential_function,
     potential_change,
 )
-from .ppo import collect_rollout, update
+from .ppo import collect_vector_rollout, update
 
 
 def _status(message: str) -> None:
@@ -35,6 +35,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--updates", type=int, default=1000)
     parser.add_argument("--steps-per-update", type=int, default=2048)
+    parser.add_argument("--environments", type=int, default=8)
     parser.add_argument("--maximum-steps", type=int, default=3000)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
@@ -57,6 +58,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--minimum-potential-scale", type=float, default=0.0025)
     parser.add_argument("--potential-bootstrap-games", type=int, default=4)
     parser.add_argument("--potential-refresh-interval", type=int, default=1)
+    parser.add_argument("--potential-batches-per-epoch", type=int, default=64)
     parser.add_argument("--potential-refresh-alpha", type=float, default=0.25)
     parser.add_argument("--potential-validation-tolerance", type=float, default=0.02)
     parser.add_argument("--potential-change-limit", type=float, default=0.10)
@@ -94,11 +96,13 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
     positive = (
         "updates",
         "steps_per_update",
+        "environments",
         "maximum_steps",
         "potential_epochs",
         "potential_buffer_size",
         "potential_ensemble_size",
         "potential_refresh_interval",
+        "potential_batches_per_epoch",
         "history_length",
     )
     for name in positive:
@@ -137,16 +141,17 @@ def main() -> None:
         torch.cuda.manual_seed_all(arguments.seed)
     _status(
         f"startup device={device.type} group={arguments.training_group} "
-        f"updates={arguments.updates} maximum_steps={arguments.maximum_steps}"
+        f"updates={arguments.updates} environments={arguments.environments} "
+        f"maximum_steps={arguments.maximum_steps}"
     )
-    environment = FootballEnv(arguments.maximum_steps, arguments.seed)
+    bootstrap_environment = FootballEnv(arguments.maximum_steps, arguments.seed)
     potential_scale = arguments.potential_scale
     if arguments.training_group == "terminal":
         potential_scale = 0.0
-    environment.set_potential_scale(potential_scale)
-    observation = environment.reset(arguments.seed)
+    bootstrap_environment.set_potential_scale(potential_scale)
+    observation = bootstrap_environment.reset(arguments.seed)
     frame_size = encode(observation, arguments.maximum_steps).numel()
-    policy = ActorCritic(frame_size, environment.action_count).to(device)
+    policy = ActorCritic(frame_size, bootstrap_environment.action_count).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=arguments.learning_rate)
     potential_model = PotentialEnsemble(
         frame_size,
@@ -157,10 +162,9 @@ def main() -> None:
         potential_model.parameters(), lr=arguments.potential_learning_rate
     )
     potential_dataset = EpisodeDataset(arguments.potential_buffer_size)
-    episode_history: list[dict] = []
-    policy_history: list[dict] = []
     potential_metrics = {"outcome": 0.0, "oda": 0.0, "symmetry": 0.0}
     bootstrap_episodes: list[Episode] = []
+    snapshot: FrozenPotential | None = None
 
     start_iteration = 1
     if arguments.resume is not None:
@@ -168,7 +172,7 @@ def main() -> None:
         checkpoint = torch.load(arguments.resume, map_location=device, weights_only=True)
         expected = {
             "frame_size": frame_size,
-            "action_count": environment.action_count,
+            "action_count": bootstrap_environment.action_count,
             "maximum_steps": arguments.maximum_steps,
             "history_length": arguments.history_length,
             "potential_ensemble_size": arguments.potential_ensemble_size,
@@ -191,13 +195,7 @@ def main() -> None:
             potential_optimizer.load_state_dict(checkpoint["potential_optimizer"])
         potential_metrics = checkpoint.get("potential_metrics", potential_metrics)
         potential_scale = float(checkpoint.get("potential_scale", potential_scale))
-        environment.set_potential_scale(potential_scale)
         snapshot = FrozenPotential(potential_model)
-        environment.set_potential(
-            make_potential_function(
-                snapshot, arguments.maximum_steps, arguments.history_length
-            )
-        )
         input_dataset = arguments.dataset or _sidecar(
             arguments.resume, ".episodes.pt"
         )
@@ -225,7 +223,7 @@ def main() -> None:
             _status(
                 f"bootstrap game={game + 1}/{bootstrap_games} seed={game_seed} start"
             )
-            observations, goals = environment.collect_builtin_episode(
+            observations, goals = bootstrap_environment.collect_builtin_episode(
                 game_seed,
                 progress=lambda step, maximum, index=game + 1: _status(
                     f"bootstrap game={index}/{bootstrap_games} "
@@ -254,15 +252,11 @@ def main() -> None:
             oda_weight=0.0 if arguments.training_group == "learned" else 0.25,
             history_length=arguments.history_length,
             progress=lambda message: _status(f"initial-potential {message}"),
+            maximum_batches_per_epoch=arguments.potential_batches_per_epoch,
         )
         if arguments.training_group == "oda":
             policy.initialize_oda(potential_model.averaged_oda())
         snapshot = FrozenPotential(potential_model)
-        environment.set_potential(
-            make_potential_function(
-                snapshot, arguments.maximum_steps, arguments.history_length
-            )
-        )
         _status("initial-potential validation")
         validation_metrics = evaluate_potential(
             potential_model,
@@ -286,19 +280,35 @@ def main() -> None:
             {f"test_{name}": value for name, value in test_metrics.items()}
         )
         _status("initial-potential complete")
-    observation = environment.reset(arguments.seed + len(bootstrap_episodes))
+    del bootstrap_environment
+    environment = VectorFootballEnv(
+        arguments.environments,
+        arguments.maximum_steps,
+        arguments.seed + len(bootstrap_episodes),
+    )
+    environment.set_potential_scale(potential_scale)
+    if snapshot is not None:
+        environment.set_potential(
+            make_batched_potential_function(
+                snapshot, arguments.maximum_steps, arguments.history_length
+            )
+        )
+    observations = environment.reset()
+    episode_histories = [[] for _ in range(arguments.environments)]
+    policy_histories = [[] for _ in range(arguments.environments)]
+    _status(f"vector-environment count={arguments.environments} ready")
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
         _status(
             f"update={iteration} rollout start target_steps={arguments.steps_per_update}"
         )
-        rollout, observation, games, episodes = collect_rollout(
+        rollout, observations, games, episodes = collect_vector_rollout(
             environment,
             policy,
-            observation,
+            observations,
             arguments.steps_per_update,
-            episode_history=episode_history,
-            policy_history=policy_history,
+            episode_histories=episode_histories,
+            policy_histories=policy_histories,
             history_length=arguments.history_length,
             progress=lambda message: _status(f"update={iteration} rollout {message}"),
         )
@@ -365,6 +375,7 @@ def main() -> None:
                 progress=lambda message: _status(
                     f"update={iteration} potential {message}"
                 ),
+                maximum_batches_per_epoch=arguments.potential_batches_per_epoch,
             )
             _status(f"update={iteration} potential candidate-validation")
             validation_metrics = evaluate_potential(
@@ -443,7 +454,7 @@ def main() -> None:
             )
             snapshot = FrozenPotential(potential_model)
             environment.set_potential(
-                make_potential_function(
+                make_batched_potential_function(
                     snapshot, arguments.maximum_steps, arguments.history_length
                 )
             )
@@ -474,7 +485,9 @@ def main() -> None:
             "action_count": environment.action_count,
             "maximum_steps": arguments.maximum_steps,
             "history_length": arguments.history_length,
+            "environments": arguments.environments,
             "potential_ensemble_size": arguments.potential_ensemble_size,
+            "potential_batches_per_epoch": arguments.potential_batches_per_epoch,
             "potential_scale": potential_scale,
             "feature_scaling": "fixed",
             "oda_horizon": ODA_HORIZON,

@@ -7,9 +7,14 @@
 #include <Python.h>
 
 #include <cstdint>
+#include <condition_variable>
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include "gfootball_actions.h"
 #include "environment.hpp"
@@ -17,14 +22,148 @@
 namespace {
 
 constexpr char kCapsuleName[] = "gfootball.TrainingEnvironment";
+constexpr char kBatchCapsuleName[] = "gfootball.TrainingEnvironmentBatch";
+
+class TrainingEnvironmentBatch {
+ public:
+  TrainingEnvironmentBatch(const std::filesystem::path& data_directory,
+                           const std::filesystem::path& font_file,
+                           int maximum_steps, int count)
+      : maximum_steps_(maximum_steps) {
+    if (count <= 0) {
+      throw std::invalid_argument("environment count must be positive");
+    }
+    environments_.reserve(count);
+    for (int index = 0; index < count; ++index) {
+      environments_.push_back(std::make_unique<TrainingEnvironment>(
+          data_directory, font_file, maximum_steps));
+    }
+    actions_.resize(count);
+    observations_.resize(count);
+    workers_.reserve(count);
+    for (int index = 0; index < count; ++index) {
+      workers_.emplace_back(&TrainingEnvironmentBatch::Worker, this, index);
+    }
+  }
+
+  ~TrainingEnvironmentBatch() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      ++generation_;
+    }
+    work_ready_.notify_all();
+    for (std::thread& worker : workers_) worker.join();
+  }
+
+  int size() const { return static_cast<int>(environments_.size()); }
+  int maximum_steps() const { return maximum_steps_; }
+
+  std::vector<TrainingObservation> Reset(
+      const std::vector<std::uint32_t>& seeds,
+      const std::vector<bool>& left_teams) {
+    if (seeds.size() != environments_.size() ||
+        left_teams.size() != environments_.size()) {
+      throw std::invalid_argument(
+          "batch reset requires one seed and side per environment");
+    }
+    // Engine reset seeds a legacy process-wide C RNG before seeding the
+    // match-local stream, so resets remain serial and deterministic.
+    for (std::size_t index = 0; index < environments_.size(); ++index) {
+      observations_[index] =
+          environments_[index]->Reset(seeds[index], left_teams[index]);
+    }
+    return observations_;
+  }
+
+  TrainingObservation ResetOne(int index, std::uint32_t seed,
+                               bool left_team) {
+    if (index < 0 || index >= size()) {
+      throw std::out_of_range("environment index is out of range");
+    }
+    observations_[index] = environments_[index]->Reset(seed, left_team);
+    return observations_[index];
+  }
+
+  std::vector<TrainingObservation> Step(
+      const std::vector<std::array<std::int32_t,
+                                   kGFootballPlayersPerTeam>>& actions) {
+    if (actions.size() != environments_.size()) {
+      throw std::invalid_argument(
+          "batch step requires one decision per environment");
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      actions_ = actions;
+      completed_ = 0;
+      exception_ = nullptr;
+      ++generation_;
+    }
+    work_ready_.notify_all();
+    std::unique_lock<std::mutex> lock(mutex_);
+    work_complete_.wait(
+        lock, [&]() { return completed_ == environments_.size(); });
+    if (exception_) std::rethrow_exception(exception_);
+    return observations_;
+  }
+
+ private:
+  void Worker(int index) {
+    std::size_t observed_generation = 0;
+    while (true) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      work_ready_.wait(lock, [&]() {
+        return stopping_ || generation_ != observed_generation;
+      });
+      if (stopping_) return;
+      observed_generation = generation_;
+      lock.unlock();
+      try {
+        observations_[index] =
+            environments_[index]->Step(actions_[index]);
+      } catch (...) {
+        lock.lock();
+        if (!exception_) exception_ = std::current_exception();
+        lock.unlock();
+      }
+      lock.lock();
+      ++completed_;
+      const bool finished = completed_ == environments_.size();
+      lock.unlock();
+      if (finished) work_complete_.notify_one();
+    }
+  }
+
+  int maximum_steps_;
+  std::vector<std::unique_ptr<TrainingEnvironment>> environments_;
+  std::vector<std::array<std::int32_t, kGFootballPlayersPerTeam>> actions_;
+  std::vector<TrainingObservation> observations_;
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable work_ready_;
+  std::condition_variable work_complete_;
+  std::size_t generation_ = 0;
+  std::size_t completed_ = 0;
+  bool stopping_ = false;
+  std::exception_ptr exception_;
+};
 
 TrainingEnvironment* GetEnvironment(PyObject* capsule) {
   return static_cast<TrainingEnvironment*>(
       PyCapsule_GetPointer(capsule, kCapsuleName));
 }
 
+TrainingEnvironmentBatch* GetBatchEnvironment(PyObject* capsule) {
+  return static_cast<TrainingEnvironmentBatch*>(
+      PyCapsule_GetPointer(capsule, kBatchCapsuleName));
+}
+
 void DestroyEnvironment(PyObject* capsule) {
   delete GetEnvironment(capsule);
+}
+
+void DestroyBatchEnvironment(PyObject* capsule) {
+  delete GetBatchEnvironment(capsule);
 }
 
 PyObject* PositionToPython(const float value[3]) {
@@ -254,6 +393,19 @@ PyObject* TranslateExceptions(Function function) {
   }
 }
 
+template <typename Function>
+auto RunWithoutGil(Function function) -> decltype(function()) {
+  PyThreadState* state = PyEval_SaveThread();
+  try {
+    auto result = function();
+    PyEval_RestoreThread(state);
+    return result;
+  } catch (...) {
+    PyEval_RestoreThread(state);
+    throw;
+  }
+}
+
 PyObject* Create(PyObject*, PyObject* arguments, PyObject* keywords) {
   const char* data_directory = nullptr;
   const char* font_file = nullptr;
@@ -271,6 +423,29 @@ PyObject* Create(PyObject*, PyObject* arguments, PyObject* keywords) {
         std::filesystem::u8path(font_file), maximum_steps);
     PyObject* capsule = PyCapsule_New(environment.get(), kCapsuleName,
                                       DestroyEnvironment);
+    if (capsule) environment.release();
+    return capsule;
+  });
+}
+
+PyObject* CreateBatch(PyObject*, PyObject* arguments, PyObject* keywords) {
+  const char* data_directory = nullptr;
+  const char* font_file = nullptr;
+  int maximum_steps = 3000;
+  int count = 1;
+  static const char* names[] = {
+      "data_directory", "font_file", "maximum_steps", "count", nullptr};
+  if (!PyArg_ParseTupleAndKeywords(arguments, keywords, "ss|ii",
+                                   const_cast<char**>(names), &data_directory,
+                                   &font_file, &maximum_steps, &count)) {
+    return nullptr;
+  }
+  return TranslateExceptions([&]() -> PyObject* {
+    auto environment = std::make_unique<TrainingEnvironmentBatch>(
+        std::filesystem::u8path(data_directory),
+        std::filesystem::u8path(font_file), maximum_steps, count);
+    PyObject* capsule = PyCapsule_New(environment.get(), kBatchCapsuleName,
+                                      DestroyBatchEnvironment);
     if (capsule) environment.release();
     return capsule;
   });
@@ -336,12 +511,181 @@ PyObject* Step(PyObject*, PyObject* arguments) {
   });
 }
 
+PyObject* ResetBatch(PyObject*, PyObject* arguments) {
+  PyObject* capsule = nullptr;
+  PyObject* seed_object = nullptr;
+  PyObject* side_object = nullptr;
+  if (!PyArg_ParseTuple(arguments, "OOO", &capsule, &seed_object,
+                        &side_object)) {
+    return nullptr;
+  }
+  TrainingEnvironmentBatch* environment = GetBatchEnvironment(capsule);
+  if (!environment) return nullptr;
+  PyObject* seeds = PySequence_Fast(
+      seed_object, "seeds must be a sequence with one value per environment");
+  PyObject* sides = PySequence_Fast(
+      side_object, "sides must be a sequence with one value per environment");
+  if (!seeds || !sides) {
+    Py_XDECREF(seeds);
+    Py_XDECREF(sides);
+    return nullptr;
+  }
+  const int count = environment->size();
+  if (PySequence_Fast_GET_SIZE(seeds) != count ||
+      PySequence_Fast_GET_SIZE(sides) != count) {
+    Py_DECREF(seeds);
+    Py_DECREF(sides);
+    PyErr_SetString(PyExc_ValueError,
+                    "batch reset requires one seed and side per environment");
+    return nullptr;
+  }
+  std::vector<std::uint32_t> seed_values(count);
+  std::vector<bool> side_values(count);
+  for (int index = 0; index < count; ++index) {
+    const unsigned long long seed = PyLong_AsUnsignedLongLong(
+        PySequence_Fast_GET_ITEM(seeds, index));
+    const int side = PyObject_IsTrue(PySequence_Fast_GET_ITEM(sides, index));
+    if (PyErr_Occurred() || seed > UINT32_MAX || side < 0) {
+      Py_DECREF(seeds);
+      Py_DECREF(sides);
+      if (!PyErr_Occurred()) {
+        PyErr_SetString(PyExc_ValueError, "seed must fit in 32 bits");
+      }
+      return nullptr;
+    }
+    seed_values[index] = static_cast<std::uint32_t>(seed);
+    side_values[index] = side != 0;
+  }
+  Py_DECREF(seeds);
+  Py_DECREF(sides);
+  return TranslateExceptions([&]() -> PyObject* {
+    const std::vector<TrainingObservation> observations = RunWithoutGil(
+        [&]() { return environment->Reset(seed_values, side_values); });
+    PyObject* result = PyList_New(count);
+    if (!result) return nullptr;
+    for (int index = 0; index < count; ++index) {
+      PyObject* observation = ObservationToPython(observations[index]);
+      if (!observation) {
+        Py_DECREF(result);
+        return nullptr;
+      }
+      PyList_SET_ITEM(result, index, observation);
+    }
+    return result;
+  });
+}
+
+PyObject* ResetBatchOne(PyObject*, PyObject* arguments) {
+  PyObject* capsule = nullptr;
+  int index = 0;
+  unsigned long long seed = 0;
+  int left_team = 1;
+  if (!PyArg_ParseTuple(arguments, "OiK|p", &capsule, &index, &seed,
+                        &left_team)) {
+    return nullptr;
+  }
+  if (seed > UINT32_MAX) {
+    PyErr_SetString(PyExc_ValueError, "seed must fit in 32 bits");
+    return nullptr;
+  }
+  TrainingEnvironmentBatch* environment = GetBatchEnvironment(capsule);
+  if (!environment) return nullptr;
+  return TranslateExceptions([&]() {
+    const TrainingObservation observation = RunWithoutGil([&]() {
+      return environment->ResetOne(index, static_cast<std::uint32_t>(seed),
+                                   left_team != 0);
+    });
+    return ObservationToPython(observation);
+  });
+}
+
+PyObject* StepBatch(PyObject*, PyObject* arguments) {
+  PyObject* capsule = nullptr;
+  PyObject* decisions_object = nullptr;
+  if (!PyArg_ParseTuple(arguments, "OO", &capsule, &decisions_object)) {
+    return nullptr;
+  }
+  TrainingEnvironmentBatch* environment = GetBatchEnvironment(capsule);
+  if (!environment) return nullptr;
+  PyObject* decisions = PySequence_Fast(
+      decisions_object, "decisions must contain one decision per environment");
+  if (!decisions) return nullptr;
+  const int count = environment->size();
+  if (PySequence_Fast_GET_SIZE(decisions) != count) {
+    Py_DECREF(decisions);
+    PyErr_SetString(PyExc_ValueError,
+                    "batch step requires one decision per environment");
+    return nullptr;
+  }
+  std::vector<std::array<std::int32_t, kGFootballPlayersPerTeam>> values(count);
+  for (int environment_index = 0; environment_index < count;
+       ++environment_index) {
+    PyObject* decision = PySequence_Fast(
+        PySequence_Fast_GET_ITEM(decisions, environment_index),
+        "each decision must contain eleven actions");
+    if (!decision) {
+      Py_DECREF(decisions);
+      return nullptr;
+    }
+    if (PySequence_Fast_GET_SIZE(decision) != kGFootballPlayersPerTeam) {
+      Py_DECREF(decision);
+      Py_DECREF(decisions);
+      PyErr_SetString(PyExc_ValueError,
+                      "each decision must contain eleven actions");
+      return nullptr;
+    }
+    for (int player = 0; player < kGFootballPlayersPerTeam; ++player) {
+      const long action =
+          PyLong_AsLong(PySequence_Fast_GET_ITEM(decision, player));
+      if (action == -1 && PyErr_Occurred()) {
+        Py_DECREF(decision);
+        Py_DECREF(decisions);
+        return nullptr;
+      }
+      values[environment_index][player] = static_cast<std::int32_t>(action);
+    }
+    Py_DECREF(decision);
+  }
+  Py_DECREF(decisions);
+  return TranslateExceptions([&]() -> PyObject* {
+    const std::vector<TrainingObservation> observations =
+        RunWithoutGil([&]() { return environment->Step(values); });
+    PyObject* result = PyList_New(count);
+    if (!result) return nullptr;
+    for (int index = 0; index < count; ++index) {
+      PyObject* pair = PyTuple_New(2);
+      PyObject* observation = ObservationToPython(observations[index]);
+      PyObject* terminated = PyBool_FromLong(
+          observations[index].step >= environment->maximum_steps());
+      if (!pair || !observation || !terminated) {
+        Py_XDECREF(pair);
+        Py_XDECREF(observation);
+        Py_XDECREF(terminated);
+        Py_DECREF(result);
+        return nullptr;
+      }
+      PyTuple_SET_ITEM(pair, 0, observation);
+      PyTuple_SET_ITEM(pair, 1, terminated);
+      PyList_SET_ITEM(result, index, pair);
+    }
+    return result;
+  });
+}
+
 PyMethodDef methods[] = {
     {"create", reinterpret_cast<PyCFunction>(Create),
      METH_VARARGS | METH_KEYWORDS, "Create one native training environment."},
     {"reset", Reset, METH_VARARGS, "Reset a match with the requested seed."},
     {"step", Step, METH_VARARGS,
      "Submit one player/action decision and advance the match."},
+    {"create_batch", reinterpret_cast<PyCFunction>(CreateBatch),
+     METH_VARARGS | METH_KEYWORDS, "Create native training environments."},
+    {"reset_batch", ResetBatch, METH_VARARGS,
+     "Reset every native training environment."},
+    {"reset_batch_one", ResetBatchOne, METH_VARARGS,
+     "Reset one native training environment."},
+    {"step_batch", StepBatch, METH_VARARGS,
+     "Advance native training environments concurrently."},
     {nullptr, nullptr, 0, nullptr},
 };
 

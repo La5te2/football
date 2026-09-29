@@ -14,6 +14,9 @@ from .dataset import Episode, attention_targets, mirror_observation
 
 
 Observation = dict[str, Any]
+MIRROR_CACHE_SIZE = 4096
+
+
 @dataclass
 class _Record:
     episode: Episode
@@ -28,13 +31,26 @@ class _Record:
 
 
 def _record_history(
-    record: _Record, history_length: int, opposite: bool = False
+    record: _Record,
+    history_length: int,
+    opposite: bool = False,
+    mirror_cache: dict[tuple[int, int], Observation] | None = None,
 ) -> list[Observation]:
     start = max(0, record.index - history_length + 1)
-    history = record.episode.observations[start : record.index + 1]
-    if record.mirrored != opposite:
-        return [mirror_observation(observation) for observation in history]
-    return history
+    if record.mirrored == opposite:
+        return record.episode.observations[start : record.index + 1]
+    result = []
+    for index in range(start, record.index + 1):
+        key = (id(record.episode), index)
+        mirrored = mirror_cache.get(key) if mirror_cache is not None else None
+        if mirrored is None:
+            mirrored = mirror_observation(record.episode.observations[index])
+            if mirror_cache is not None:
+                if len(mirror_cache) >= MIRROR_CACHE_SIZE:
+                    mirror_cache.pop(next(iter(mirror_cache)))
+                mirror_cache[key] = mirrored
+        result.append(mirrored)
+    return result
 
 
 class ODAConditionedPotential(nn.Module):
@@ -199,6 +215,20 @@ class FrozenPotential:
             )[0].item()
         )
 
+    def predict(
+        self,
+        observation_histories: Sequence[Sequence[Observation]],
+        maximum_steps: int,
+        history_length: int,
+    ) -> list[float]:
+        """Evaluate several independent match histories in one network pass."""
+
+        if not observation_histories:
+            return []
+        return self.model.predict(
+            observation_histories, maximum_steps, history_length
+        ).tolist()
+
 
 def potential_change(
     previous: PotentialEnsemble,
@@ -294,6 +324,7 @@ def fit_potential(
     symmetry_weight: float = 0.1,
     history_length: int = 4,
     progress: Callable[[str], None] | None = None,
+    maximum_batches_per_epoch: int | None = None,
 ) -> dict[str, float]:
     """Fit outcome, confidence-weighted ODA, and mirror-consistency losses."""
 
@@ -303,13 +334,14 @@ def fit_potential(
         for member_index, member in enumerate(model.members, start=1):
             if progress is not None:
                 progress(f"member={member_index}/{member_count} start")
-            member_progress = (
-                lambda message, index=member_index: progress(
-                    f"member={index}/{member_count} {message}"
-                )
-                if progress is not None
-                else None
-            )
+            member_progress = None
+            if progress is not None:
+                def report_member(
+                    message: str, index: int = member_index
+                ) -> None:
+                    progress(f"member={index}/{member_count} {message}")
+
+                member_progress = report_member
             results.append(
                 fit_potential(
                     member,
@@ -323,6 +355,7 @@ def fit_potential(
                     symmetry_weight,
                     history_length,
                     member_progress,
+                    maximum_batches_per_epoch,
                 )
             )
         return {
@@ -335,6 +368,7 @@ def fit_potential(
         return {"outcome": 0.0, "oda": 0.0, "symmetry": 0.0}
 
     model.train()
+    mirror_cache: dict[tuple[int, int], Observation] = {}
     totals = {"outcome": 0.0, "oda": 0.0, "symmetry": 0.0}
     updates = 0
     stratum_counts: dict[tuple[int, int, int], int] = {}
@@ -343,17 +377,30 @@ def fit_potential(
     weights = torch.tensor(
         [1.0 / stratum_counts[record.stratum] for record in records]
     )
-    batch_count = (len(records) + batch_size - 1) // batch_size
+    sample_count = len(records)
+    if maximum_batches_per_epoch is not None:
+        if maximum_batches_per_epoch <= 0:
+            raise ValueError("maximum batches per epoch must be positive")
+        sample_count = min(sample_count, maximum_batches_per_epoch * batch_size)
+    batch_count = (sample_count + batch_size - 1) // batch_size
     report_interval = max(1, batch_count // 4)
     for epoch in range(1, epochs + 1):
-        order = torch.multinomial(weights, len(records), replacement=True)
+        order = torch.multinomial(weights, sample_count, replacement=True)
         for batch_index, indices in enumerate(order.split(batch_size), start=1):
             selected = [records[index] for index in indices.tolist()]
             original_histories = [
-                _record_history(record, history_length) for record in selected
+                _record_history(
+                    record, history_length, mirror_cache=mirror_cache
+                )
+                for record in selected
             ]
             mirror_histories = [
-                _record_history(record, history_length, opposite=True)
+                _record_history(
+                    record,
+                    history_length,
+                    opposite=True,
+                    mirror_cache=mirror_cache,
+                )
                 for record in selected
             ]
             encoded, own, opponent, context, anchors, opponent_anchors = batch_histories(
@@ -472,11 +519,22 @@ def evaluate_potential(
         prefix: [[0.0, 0.0, 0.0] for _ in range(10)]
         for prefix in ("offense", "defense")
     }
+    mirror_cache: dict[tuple[int, int], Observation] = {}
     for start in range(0, len(records), batch_size):
         selected = records[start : start + batch_size]
-        histories = [_record_history(record, history_length) for record in selected]
+        histories = [
+            _record_history(
+                record, history_length, mirror_cache=mirror_cache
+            )
+            for record in selected
+        ]
         mirror_histories = [
-            _record_history(record, history_length, opposite=True)
+            _record_history(
+                record,
+                history_length,
+                opposite=True,
+                mirror_cache=mirror_cache,
+            )
             for record in selected
         ]
         inputs = batch_histories(
@@ -620,3 +678,13 @@ def make_potential_function(
     """Adapt a frozen model snapshot to the environment reward callback."""
 
     return lambda history: snapshot(history, maximum_steps, history_length)
+
+
+def make_batched_potential_function(
+    snapshot: FrozenPotential, maximum_steps: int, history_length: int
+) -> Callable[[Sequence[Sequence[Observation]]], list[float]]:
+    """Adapt a frozen model snapshot to batched environment rewards."""
+
+    return lambda histories: snapshot.predict(
+        histories, maximum_steps, history_length
+    )
