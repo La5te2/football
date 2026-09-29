@@ -16,6 +16,7 @@ dist/
 .venv/
 football-env*/
 checkpoints/
+runs/
 matches/
 /bin/
 *.gfr
