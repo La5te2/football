@@ -34,7 +34,7 @@ On Linux, start the formal background run from the repository root:
 bash training/jackaroo/run.sh
 ```
 
-The script selects the system C++ runtime, validates the native environment, uses every valid action from 128 complete built-in AI matches for two behavior-cloning epochs, collects complete decisive next-goal episodes in parallel until each PPO update contains at least 8192 retained transitions, reuses them for four PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
+The script selects the system C++ runtime, validates the native environment, uses every valid action from 256 complete built-in AI matches for two behavior-cloning epochs, collects complete decisive next-goal episodes in parallel until each PPO update contains at least 8192 retained transitions, reuses them for four PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
 
 Running the Python module directly collects 128 built-in AI matches, performs two behavior-cloning epochs, then starts PPO with eight concurrent native environments. The default checkpoint is `runs/jackaroo.pt` and the compact per-update log is `runs/jackaroo.pt.jsonl`.
 
