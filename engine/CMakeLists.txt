@@ -83,15 +83,24 @@ elseif(WIN32)
       SDL2_ttf::SDL2_ttf SDL2::SDL2_gfx SDL2::SDL2main)
 endif()
 
-set(ENGINE_LIBRARIES gamelib menulib datalib blunted2
+set(ENGINE_INTERNAL_LIBRARIES gamelib menulib datalib blunted2)
+set(ENGINE_EXTERNAL_LIBRARIES
    Boost::filesystem Boost::system Boost::thread
    ${SDL2_LIBS_ALL} ${EGL_LIBRARIES} ${OPENGL_LIBRARIES})
 
 add_library(gfootball_engine INTERFACE)
 target_include_directories(gfootball_engine INTERFACE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(gfootball_engine INTERFACE
-  enginecore ${ENGINE_LIBRARIES})
+if(UNIX AND NOT APPLE)
+  # GNU-style linkers scan static archives from left to right.  The engine's
+  # internal archives reference each other, so rescan them as one group.
+  target_link_libraries(gfootball_engine INTERFACE
+    "-Wl,--start-group" enginecore ${ENGINE_INTERNAL_LIBRARIES}
+    "-Wl,--end-group" ${ENGINE_EXTERNAL_LIBRARIES})
+else()
+  target_link_libraries(gfootball_engine INTERFACE
+    enginecore ${ENGINE_INTERNAL_LIBRARIES} ${ENGINE_EXTERNAL_LIBRARIES})
+endif()
 
 add_executable(gfootball src/gfootball.cpp)
 target_link_libraries(gfootball PRIVATE gfootball_engine)
