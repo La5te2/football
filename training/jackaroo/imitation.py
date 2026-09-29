@@ -117,10 +117,7 @@ def collect_demonstrations(
                     if previous["is_in_play"]:
                         current_segments[index].append(
                             (
-                                tensorize(
-                                    previous,
-                                    environment.maximum_steps,
-                                ),
+                                tensorize(previous),
                                 project_builtin_action(previous, observation),
                             )
                         )
@@ -141,7 +138,8 @@ def collect_demonstrations(
                         )
                         current_segments[index] = []
                     if current_match_done[index] and current_segments[index]:
-                        match_segments[index].append((current_segments[index], 0.0))
+                        # Full-time segments without a goal are censored: they
+                        # provide no observed next-goal winner for supervision.
                         current_segments[index] = []
                 match_done[index] = match_done[index] or current_match_done[index]
             minimum_step = min(observation["step"] for observation in observations)
@@ -203,9 +201,14 @@ def pretrain_policy(
     context_parts = []
     anchor_parts = []
     opponent_anchor_parts = []
+    sample_count = len(samples)
     targets = torch.tensor([sample[1] for sample in samples], dtype=torch.long)
     encoding_batch_size = max(batch_size, 512)
-    for start in range(0, len(samples), encoding_batch_size):
+    encoding_batch_count = math.ceil(sample_count / encoding_batch_size)
+    encoding_report_interval = max(encoding_batch_count // 10, 1)
+    for batch_number, start in enumerate(
+        range(0, sample_count, encoding_batch_size), start=1
+    ):
         inputs = batch_tensor_histories(
             [sample[0] for sample in samples[start:start + encoding_batch_size]],
             history_length,
@@ -223,6 +226,14 @@ def pretrain_policy(
             inputs,
         ):
             destination.append(tensor)
+        if progress is not None and (
+            batch_number % encoding_report_interval == 0
+            or batch_number == encoding_batch_count
+        ):
+            progress(
+                f"cache samples={min(start + encoding_batch_size, sample_count)}/"
+                f"{sample_count}"
+            )
     cached_inputs_list = []
     for parts in (
         encoded_parts,
@@ -235,6 +246,8 @@ def pretrain_policy(
         cached_inputs_list.append(torch.cat(parts, dim=0))
         parts.clear()
     cached_inputs = tuple(cached_inputs_list)
+    if progress is not None:
+        progress(f"cache complete samples={sample_count}")
     value_targets = torch.tensor([sample[2] for sample in samples], dtype=torch.float32)
     counts = torch.bincount(targets, minlength=policy.action_head.out_features).float()
     class_weights = torch.zeros_like(counts)
@@ -242,7 +255,6 @@ def pretrain_policy(
     class_weights[observed] = counts[observed].rsqrt()
     class_weights[observed] /= class_weights[observed].mean()
     class_weights = class_weights.to(device)
-    sample_count = len(samples)
     del samples
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=learning_rate)
@@ -259,7 +271,11 @@ def pretrain_policy(
         total_correct = 0
         total_count = 0
         policy.train()
-        for start in range(0, sample_count, batch_size):
+        batch_count = math.ceil(sample_count / batch_size)
+        report_interval = max(batch_count // 4, 1)
+        for batch_number, start in enumerate(
+            range(0, sample_count, batch_size), start=1
+        ):
             indices = permutation[start:start + batch_size]
             batch_inputs = tuple(tensor[indices].to(device) for tensor in cached_inputs)
             batch_targets = targets[indices].to(device)
@@ -282,6 +298,13 @@ def pretrain_policy(
                 logits.argmax(dim=-1) == batch_targets
             ).sum().item()
             total_count += count
+            if progress is not None and (
+                batch_number % report_interval == 0 or batch_number == batch_count
+            ):
+                progress(
+                    f"epoch={epoch}/{epochs} "
+                    f"batch={batch_number}/{batch_count}"
+                )
         final_loss = total_loss / total_count
         final_policy_loss = total_policy_loss / total_count
         final_value_loss = total_value_loss / total_count

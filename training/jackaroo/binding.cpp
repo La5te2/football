@@ -39,6 +39,7 @@ class TrainingEnvironmentBatch {
           data_directory, font_file, maximum_steps));
     }
     actions_.resize(count);
+    active_.resize(count, true);
     observations_.resize(count);
     workers_.reserve(count);
     for (int index = 0; index < count; ++index) {
@@ -102,14 +103,17 @@ class TrainingEnvironmentBatch {
 
   std::vector<TrainingObservation> Step(
       const std::vector<std::array<std::int32_t,
-                                   kGFootballPlayersPerTeam>>& actions) {
-    if (actions.size() != environments_.size()) {
+                                   kGFootballPlayersPerTeam>>& actions,
+      const std::vector<bool>& active) {
+    if (actions.size() != environments_.size() ||
+        active.size() != environments_.size()) {
       throw std::invalid_argument(
-          "batch step requires one decision per environment");
+          "batch step requires one decision and activity flag per environment");
     }
     {
       std::lock_guard<std::mutex> lock(mutex_);
       actions_ = actions;
+      active_ = active;
       completed_ = 0;
       exception_ = nullptr;
       ++generation_;
@@ -132,10 +136,13 @@ class TrainingEnvironmentBatch {
       });
       if (stopping_) return;
       observed_generation = generation_;
+      const bool active = active_[index];
       lock.unlock();
       try {
-        observations_[index] =
-            environments_[index]->Step(actions_[index]);
+        if (active) {
+          observations_[index] =
+              environments_[index]->Step(actions_[index]);
+        }
       } catch (...) {
         lock.lock();
         if (!exception_) exception_ = std::current_exception();
@@ -152,6 +159,7 @@ class TrainingEnvironmentBatch {
   int maximum_steps_;
   std::vector<std::unique_ptr<TrainingEnvironment>> environments_;
   std::vector<std::array<std::int32_t, kGFootballPlayersPerTeam>> actions_;
+  std::vector<bool> active_;
   std::vector<TrainingObservation> observations_;
   std::vector<std::thread> workers_;
   std::mutex mutex_;
@@ -696,7 +704,9 @@ PyObject* ResetBatchOne(PyObject*, PyObject* arguments) {
 PyObject* StepBatch(PyObject*, PyObject* arguments) {
   PyObject* capsule = nullptr;
   PyObject* decisions_object = nullptr;
-  if (!PyArg_ParseTuple(arguments, "OO", &capsule, &decisions_object)) {
+  PyObject* active_object = Py_None;
+  if (!PyArg_ParseTuple(arguments, "OO|O", &capsule, &decisions_object,
+                        &active_object)) {
     return nullptr;
   }
   TrainingEnvironmentBatch* environment = GetBatchEnvironment(capsule);
@@ -741,9 +751,31 @@ PyObject* StepBatch(PyObject*, PyObject* arguments) {
     Py_DECREF(decision);
   }
   Py_DECREF(decisions);
+  std::vector<bool> active_values(count, true);
+  if (active_object != Py_None) {
+    PyObject* active = PySequence_Fast(
+        active_object, "activity mask must contain one flag per environment");
+    if (!active) return nullptr;
+    if (PySequence_Fast_GET_SIZE(active) != count) {
+      Py_DECREF(active);
+      PyErr_SetString(PyExc_ValueError,
+                      "batch step requires one activity flag per environment");
+      return nullptr;
+    }
+    for (int index = 0; index < count; ++index) {
+      const int enabled =
+          PyObject_IsTrue(PySequence_Fast_GET_ITEM(active, index));
+      if (enabled < 0) {
+        Py_DECREF(active);
+        return nullptr;
+      }
+      active_values[index] = enabled != 0;
+    }
+    Py_DECREF(active);
+  }
   return TranslateExceptions([&]() -> PyObject* {
     const std::vector<TrainingObservation> observations =
-        RunWithoutGil([&]() { return environment->Step(values); });
+        RunWithoutGil([&]() { return environment->Step(values, active_values); });
     PyObject* result = PyList_New(count);
     if (!result) return nullptr;
     for (int index = 0; index < count; ++index) {
@@ -783,7 +815,7 @@ PyMethodDef methods[] = {
     {"reset_batch_one", ResetBatchOne, METH_VARARGS,
      "Reset one native training environment."},
     {"step_batch", StepBatch, METH_VARARGS,
-     "Advance native training environments concurrently."},
+     "Advance active native training environments concurrently."},
     {nullptr, nullptr, 0, nullptr},
 };
 

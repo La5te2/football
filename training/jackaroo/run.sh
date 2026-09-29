@@ -53,8 +53,10 @@ nohup env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -u \
   --imitation-epochs 2 \
   --updates 3000 \
   --steps-per-update 8192 \
-  --ppo-epochs 8 \
+  --ppo-epochs 4 \
   --ppo-batch-size 256 \
+  --learning-rate 0.0001 \
+  --entropy-coefficient 0.001 \
   --environments "$environment_count" \
   --maximum-steps 3000 \
   --evaluation-interval 100 \

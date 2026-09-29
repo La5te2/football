@@ -27,9 +27,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--steps-per-update", type=int, default=2048)
     parser.add_argument("--environments", type=int, default=8)
     parser.add_argument("--maximum-steps", type=int, default=3000)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--ppo-batch-size", type=int, default=256)
+    parser.add_argument("--entropy-coefficient", type=float, default=0.001)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("runs/jackaroo.pt")
@@ -79,6 +80,8 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
             raise ValueError(f"{name.replace('_', '-')} must be nonnegative")
     if arguments.learning_rate <= 0.0 or arguments.imitation_learning_rate <= 0.0:
         raise ValueError("learning rates must be positive")
+    if arguments.entropy_coefficient < 0.0:
+        raise ValueError("entropy-coefficient must be nonnegative")
 
 
 def main() -> None:
@@ -104,7 +107,7 @@ def main() -> None:
 
     bootstrap_environment = FootballEnv(arguments.maximum_steps, arguments.seed)
     observation = bootstrap_environment.reset(arguments.seed)
-    frame_size = encode(observation, arguments.maximum_steps).numel()
+    frame_size = encode(observation).numel()
     policy = ActorCritic(frame_size, bootstrap_environment.action_count).to(device)
     parameter_count = sum(parameter.numel() for parameter in policy.parameters())
     _status(
@@ -118,6 +121,7 @@ def main() -> None:
         "samples": 0.0,
         "segments": 0.0,
     }
+    baseline_evaluation: dict[str, float] = {}
     start_iteration = 1
 
     if arguments.resume is not None:
@@ -140,6 +144,7 @@ def main() -> None:
                 )
         policy.load_state_dict(checkpoint["model"])
         imitation_metrics = checkpoint.get("imitation", imitation_metrics)
+        baseline_evaluation = checkpoint.get("baseline_evaluation", {})
         start_iteration = int(checkpoint.get("updates", 0)) + 1
     elif arguments.imitation_games > 0 and arguments.imitation_epochs > 0:
         _status(f"imitation collect games={arguments.imitation_games}")
@@ -172,6 +177,25 @@ def main() -> None:
             f"accuracy={imitation_metrics['accuracy']:.4f}"
         )
         del imitation_environment
+        if arguments.evaluation_games:
+            _status("imitation baseline-evaluation start")
+            baseline_evaluation = evaluate_policy(
+                policy,
+                arguments.maximum_steps,
+                arguments.history_length,
+                arguments.evaluation_games,
+                arguments.seed + 1_000_000,
+            )
+            _status(
+                "imitation baseline-evaluation "
+                f"matches={int(baseline_evaluation['wins'])}/"
+                f"{int(baseline_evaluation['draws'])}/"
+                f"{int(baseline_evaluation['losses'])} "
+                f"goal_difference={baseline_evaluation['goal_difference']:.3f} "
+                f"segments={int(baseline_evaluation['segment_wins'])}/"
+                f"{int(baseline_evaluation['segment_draws'])}/"
+                f"{int(baseline_evaluation['segment_losses'])}"
+            )
     del bootstrap_environment
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=arguments.learning_rate)
@@ -202,22 +226,25 @@ def main() -> None:
             rollout,
             epochs=arguments.ppo_epochs,
             batch_size=arguments.ppo_batch_size,
+            entropy_coefficient=arguments.entropy_coefficient,
             progress=lambda message: _status(f"update={iteration} ppo {message}"),
         )
         action_counts = torch.bincount(
             rollout.actions.detach().cpu(), minlength=environment.action_count
         ).float()
         segment_wins = sum(result == 1 for result, _ in segments)
-        segment_draws = sum(result == 0 for result, _ in segments)
+        censored_segments = sum(result == 0 for result, _ in segments)
         segment_losses = sum(result == -1 for result, _ in segments)
+        retained_segments = [segment for segment in segments if segment[0] != 0]
         diagnostics = {
             "action_distribution": (action_counts / action_counts.sum()).tolist(),
             "reward_total": rollout.reward_total,
             "segment_wins": segment_wins,
-            "segment_draws": segment_draws,
             "segment_losses": segment_losses,
+            "censored_segments": censored_segments,
             "mean_segment_steps": (
-                sum(length for _, length in segments) / len(segments)
+                sum(length for _, length in retained_segments)
+                / len(retained_segments)
             ),
         }
         evaluation: dict[str, float] = {}
@@ -243,10 +270,12 @@ def main() -> None:
         scores = " ".join(f"{left}:{right}" for left, right in matches) or "-"
         print(
             f"update={iteration} matches={scores} "
-            f"segments={segment_wins}/{segment_draws}/{segment_losses} "
+            f"segments={segment_wins}/{segment_losses} "
+            f"censored={censored_segments} "
             f"segment_steps={diagnostics['mean_segment_steps']:.1f} "
             f"policy={losses['policy']:.4f} "
             f"value={losses['value']:.4f} entropy={losses['entropy']:.4f} "
+            f"kl={losses['kl']:.5f} clipped={losses['clip_fraction']:.4f} "
             f"reward={rollout.reward_total:.3f}",
             flush=True,
         )
@@ -261,10 +290,12 @@ def main() -> None:
             "environments": arguments.environments,
             "ppo_epochs": arguments.ppo_epochs,
             "ppo_batch_size": arguments.ppo_batch_size,
+            "entropy_coefficient": arguments.entropy_coefficient,
             "objective": POLICY_OBJECTIVE,
             "feature_scaling": "fixed",
             "updates": iteration,
             "imitation": imitation_metrics,
+            "baseline_evaluation": baseline_evaluation,
             "diagnostics": diagnostics,
             "evaluation": evaluation,
             "optimizer": optimizer.state_dict(),

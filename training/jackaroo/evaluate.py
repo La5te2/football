@@ -50,7 +50,7 @@ def evaluate_policy(
         while not match_done:
             action = 0
             if observation["is_in_play"]:
-                history.append(tensorize(observation, maximum_steps))
+                history.append(tensorize(observation))
                 if len(history) > history_length:
                     del history[:-history_length]
                 with torch.inference_mode():

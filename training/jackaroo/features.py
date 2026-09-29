@@ -17,11 +17,11 @@ def _one_hot(index: int, size: int) -> list[float]:
     return result
 
 
-def encode(observation: Observation, maximum_steps: int) -> torch.Tensor:
-    """Encode every field exposed by GFootballModelObservation.
+def encode(observation: Observation) -> torch.Tensor:
+    """Encode the public football state used by the Jackaroo policy.
 
-    No training-only player selection or hidden engine state is added here.
-    Numeric scales only keep values in a useful range for the network.
+    Absolute match time and the engine step remain environment controls. No
+    training-only player selection or hidden engine state is added here.
     """
 
     values: list[float] = []
@@ -67,8 +67,6 @@ def encode(observation: Observation, maximum_steps: int) -> torch.Tensor:
     values.extend(_one_hot(observation["ball_owned_player"] + 1, 12))
     values.extend(_one_hot(observation["last_touch_team"] + 1, 3))
     values.extend(_one_hot(observation["last_touch_player"] + 1, 12))
-    values.append(observation["match_time_ms"] / 6000000.0)
-    values.append(observation["step"] / max(maximum_steps, 1))
     values.append(float(observation["is_in_play"]))
 
     for player in observation["sticky_actions"]:

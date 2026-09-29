@@ -15,7 +15,7 @@ BASE_PLAYER_FEATURES = 24
 RELATIVE_PLAYER_FEATURES = 6
 PLAYER_FEATURES = BASE_PLAYER_FEATURES + RELATIVE_PLAYER_FEATURES
 PLAYER_ACTIVE_INDEX = BASE_PLAYER_FEATURES - 2
-CONTEXT_FEATURES = 66
+CONTEXT_FEATURES = 64
 BALL_FEATURES = 9
 MATCH_FEATURES = CONTEXT_FEATURES - BALL_FEATURES
 ENTITY_WIDTH = 128
@@ -82,8 +82,8 @@ def _one_hot(index: int, size: int) -> list[float]:
     return values
 
 
-def context_features(observation: Observation, maximum_steps: int) -> list[float]:
-    """Encode ball, score, time, possession, and match mode context."""
+def context_features(observation: Observation) -> list[float]:
+    """Encode ball, score, possession, and match mode context."""
 
     values: list[float] = []
     values.extend(observation["ball_position"])
@@ -97,13 +97,7 @@ def context_features(observation: Observation, maximum_steps: int) -> list[float
     values.extend(_one_hot(observation["ball_owned_player"] + 1, 12))
     values.extend(_one_hot(observation["last_touch_team"] + 1, 3))
     values.extend(_one_hot(observation["last_touch_player"] + 1, 12))
-    values.extend(
-        (
-            observation["match_time_ms"] / 6000000.0,
-            observation["step"] / max(maximum_steps, 1),
-            float(observation["is_in_play"]),
-        )
-    )
+    values.append(float(observation["is_in_play"]))
     return values
 
 
@@ -120,7 +114,7 @@ def padded_history(
     return [window[0]] * (length - len(window)) + window
 
 
-def tensorize(observation: Observation, maximum_steps: int) -> TensorFrame:
+def tensorize(observation: Observation) -> TensorFrame:
     """Convert one public observation to reusable CPU tensors."""
 
     designated = observation["team_state"][0]["designated_possession_player"]
@@ -142,7 +136,7 @@ def tensorize(observation: Observation, maximum_steps: int) -> TensorFrame:
         else ball_position
     )
     return TensorFrame(
-        encode(observation, maximum_steps),
+        encode(observation),
         torch.tensor(
             [
                 player_features(player, ball_position, controlled_position)
@@ -157,9 +151,7 @@ def tensorize(observation: Observation, maximum_steps: int) -> TensorFrame:
             ],
             dtype=torch.float32,
         ),
-        torch.tensor(
-            context_features(observation, maximum_steps), dtype=torch.float32
-        ),
+        torch.tensor(context_features(observation), dtype=torch.float32),
         torch.tensor(designated if 0 <= designated < 11 else 0, dtype=torch.long),
         torch.tensor(
             opponent_designated if 0 <= opponent_designated < 11 else 0,

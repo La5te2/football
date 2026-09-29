@@ -4,7 +4,7 @@ Jackaroo is a single-agent football policy trained in three stages: built-in AI 
 
 Every engine step returns the complete public model observation. The selected action is assigned to the designated player, and the remaining players use the engine's TeamAI and Eliza behavior. Formation, team behavior, set pieces, football rules, physics, and animation retain the engine defaults.
 
-The policy represents both teams, the ball, and match context as 24 entity tokens. Three multi-head Transformer blocks model their spatial relationships, while a two-layer GRU combines the latest observation frames before separate Actor and Critic heads predict the action distribution and state value.
+The policy represents both teams, the ball, and match context as 24 entity tokens. Player fatigue and other observable football state remain policy inputs, while absolute match time and the engine step only control the environment boundary. Three multi-head Transformer blocks model spatial relationships, while a two-layer GRU combines the latest observation frames before separate Actor and Critic heads predict the action distribution and state value.
 
 ## Building
 
@@ -34,17 +34,17 @@ On Linux, start the formal background run from the repository root:
 bash training/jackaroo/run.sh
 ```
 
-The script selects the system C++ runtime, validates the native environment, collects 128 built-in AI matches for two behavior-cloning epochs, collects at least 8192 transitions and one completed next-goal episode from every environment per PPO update, reuses them for eight PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
+The script selects the system C++ runtime, validates the native environment, collects 128 built-in AI matches for two behavior-cloning epochs, collects complete decisive next-goal episodes in parallel until each PPO update contains at least 8192 retained transitions, reuses them for four PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
 
-The default run collects 128 built-in AI matches, performs two behavior-cloning epochs, then starts PPO with eight concurrent native environments. The default checkpoint is `runs/jackaroo.pt` and the compact per-update log is `runs/jackaroo.pt.jsonl`.
+Running the Python module directly collects 128 built-in AI matches, performs two behavior-cloning epochs, then starts PPO with eight concurrent native environments. The default checkpoint is `runs/jackaroo.pt` and the compact per-update log is `runs/jackaroo.pt.jsonl`.
 
 ```powershell
-python -m training.jackaroo.train --imitation-games 128 --imitation-epochs 2 --updates 1000 --steps-per-update 2048 --ppo-epochs 4 --ppo-batch-size 256 --environments 8 --maximum-steps 3000 --learning-rate 0.0003 --evaluation-interval 50 --evaluation-games 2 --device auto --seed 1 --history-length 4 --checkpoint runs\jackaroo.pt
+python -m training.jackaroo.train --imitation-games 128 --imitation-epochs 2 --updates 1000 --steps-per-update 2048 --ppo-epochs 4 --ppo-batch-size 256 --environments 8 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --evaluation-interval 50 --evaluation-games 2 --device auto --seed 1 --history-length 4 --checkpoint runs\jackaroo.pt
 ```
 
 Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue PPO from a checkpoint. Resume restores policy and optimizer state and skips behavior cloning.
 
-Each training episode starts at kickoff and ends when either team scores the next goal or the underlying match reaches full time. Scoring, reaching full time without another goal, and conceding produce $+1$, $0$, and $-1$ respectively; every non-terminal transition has zero reward. Goals divide one continuous match into several training episodes while preserving its score, remaining time, random state, and team state. PPO uses $gamma=1$ and $lambda=1$ so a completed episode's WDL result reaches every action in that episode without temporal decay.
+Each training episode starts at kickoff and ends when either team scores the next goal or the underlying match reaches full time. Scoring and conceding produce $+1$ and $-1$ respectively, while every non-terminal transition has zero reward. A full-time episode without a goal remains in evaluation statistics but is excluded from behavior cloning and PPO because it has no observed next-goal winner. Goals divide one continuous match into several training episodes while preserving its score, remaining time, random state, and team state. PPO assigns the completed episode's undiscounted result to every action in that episode and trains only on complete episodes.
 
 ## Evaluation
 

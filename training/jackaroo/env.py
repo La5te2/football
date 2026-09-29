@@ -167,13 +167,18 @@ class VectorFootballEnv:
         self._observations = [result[0] for result in results]
         return self._observations, [bool(result[1]) for result in results]
 
-    def step(self, actions: Sequence[int]) -> tuple[
+    def step(
+        self, actions: Sequence[int], active: Sequence[bool] | None = None
+    ) -> tuple[
         list[Observation], list[float], list[bool], list[dict[str, Any]]
     ]:
-        """Advance every match and report next-goal segment boundaries."""
+        """Advance active matches and leave completed segment slots frozen."""
 
         if len(actions) != self.count:
             raise ValueError("one action is required per environment")
+        active_flags = [True] * self.count if active is None else list(active)
+        if len(active_flags) != self.count:
+            raise ValueError("one activity flag is required per environment")
         decisions = []
         previous_observations = self._observations
         for index, action in enumerate(actions):
@@ -186,13 +191,27 @@ class VectorFootballEnv:
                 decision[player] = action
             decisions.append(decision)
 
-        results = native.step_batch(self._native, decisions)
+        results = native.step_batch(self._native, decisions, active_flags)
         observations = [result[0] for result in results]
         match_done = [bool(result[1]) for result in results]
         rewards: list[float] = []
         segment_done: list[bool] = []
         infos: list[dict[str, Any]] = []
         for index, current in enumerate(observations):
+            if not active_flags[index]:
+                rewards.append(0.0)
+                segment_done.append(False)
+                infos.append(
+                    {
+                        "goals": current["goals"],
+                        "step": current["step"],
+                        "segment_result": None,
+                        "segment_steps": 0,
+                        "match_done": match_done[index],
+                        "action_applied": False,
+                    }
+                )
+                continue
             result = _goal_result(previous_observations[index], current)
             action_applied = bool(previous_observations[index]["is_in_play"])
             if action_applied:
