@@ -19,7 +19,7 @@ def evaluate_policy(
     history_length: int,
     games: int,
     seed: int,
-    progress: Callable[[int, tuple[int, int]], None] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
     """Evaluate one policy over complete matches and next-goal episodes."""
 
@@ -47,6 +47,7 @@ def evaluate_policy(
         history = []
         match_done = False
         info = {"goals": (0, 0)}
+        next_progress_step = 500
         while not match_done:
             action = 0
             if observation["is_in_play"]:
@@ -67,9 +68,20 @@ def evaluate_policy(
                 segment_steps += info["segment_steps"]
                 history.clear()
             match_done = info["match_done"]
+            if progress is not None and observation["step"] >= next_progress_step:
+                goals = tuple(info["goals"])
+                progress(
+                    f"game={game + 1}/{games} "
+                    f"step={observation['step']}/{maximum_steps} "
+                    f"score={goals[0]}:{goals[1]}"
+                )
+                next_progress_step += 500
         goals = tuple(info["goals"])
         if progress is not None:
-            progress(game + 1, goals)
+            progress(
+                f"game={game + 1}/{games} complete "
+                f"score={goals[0]}:{goals[1]}"
+            )
         own, opponent = goals
         wins += own > opponent
         draws += own == opponent
@@ -125,9 +137,7 @@ def main() -> None:
         history_length,
         arguments.games,
         arguments.seed,
-        progress=lambda game, goals: print(
-            f"game={game} score={goals[0]}:{goals[1]}"
-        ),
+        progress=print,
     )
     print(
         f"summary matches={int(metrics['wins'])}/{int(metrics['draws'])}/"

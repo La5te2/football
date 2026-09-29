@@ -184,6 +184,9 @@ def main() -> None:
                 arguments.history_length,
                 arguments.evaluation_games,
                 arguments.seed + 1_000_000,
+                progress=lambda message: _status(
+                    f"imitation baseline-evaluation {message}"
+                ),
             )
             _status(
                 "imitation baseline-evaluation "
@@ -255,6 +258,9 @@ def main() -> None:
                 arguments.history_length,
                 arguments.evaluation_games,
                 arguments.seed + 1_000_000,
+                progress=lambda message: _status(
+                    f"update={iteration} evaluation {message}"
+                ),
             )
             _status(
                 f"update={iteration} evaluation "

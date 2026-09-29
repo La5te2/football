@@ -32,8 +32,8 @@ fi
 PRELOAD="$SYSTEM_LIBSTDCPP${LD_PRELOAD:+:$LD_PRELOAD}"
 cd "$ROOT"
 if ! env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -c \
-  "import torch; from training.jackaroo.env import FootballEnv"; then
-  echo "Torch or the native environment could not be loaded."
+  "import torch; from training.jackaroo.env import VectorFootballEnv; e = VectorFootballEnv(1, 1, 1); e.reset(); e.step([0], [False])"; then
+  echo "Torch or the current native vector environment could not be loaded."
   echo "Build it first with: bash training/jackaroo/build.sh"
   exit 1
 fi
