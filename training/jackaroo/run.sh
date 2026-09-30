@@ -32,16 +32,10 @@ fi
 PRELOAD="$SYSTEM_LIBSTDCPP${LD_PRELOAD:+:$LD_PRELOAD}"
 cd "$ROOT"
 if ! env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -c \
-  "import torch; from training.jackaroo.env import VectorFootballEnv; e = VectorFootballEnv(1, 1, 1); e.reset(); e.step([0], [False])"; then
+  "import torch; from training.jackaroo.env import SelfPlayVectorFootballEnv; e = SelfPlayVectorFootballEnv(1, 1, 1); e.reset(); e.step([[0, 0]], [False])"; then
   echo "Torch or the current native vector environment could not be loaded."
   echo "Build it first with: bash training/jackaroo/build.sh"
   exit 1
-fi
-
-cpu_count="$(nproc)"
-environment_count=16
-if (( cpu_count < environment_count )); then
-  environment_count="$cpu_count"
 fi
 
 mkdir -p "$RUN_DIR"
@@ -50,16 +44,16 @@ nohup env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -u \
   -m training.jackaroo.train \
   --device auto \
   --updates 3000 \
-  --steps-per-update 8192 \
+  --games-per-update 256 \
   --sequence-length 32 \
   --ppo-epochs 4 \
   --ppo-batch-size 256 \
   --learning-rate 0.0001 \
   --entropy-coefficient 0.001 \
-  --environments "$environment_count" \
+  --flight 16 \
   --maximum-steps 3000 \
-  --evaluation-interval 100 \
-  --evaluation-games 10 \
+  --validation-seed 42 \
+  --validation-directory "$RUN_DIR/validation" \
   --seed 1 \
   --checkpoint "$CHECKPOINT" \
   "$@" \
@@ -67,7 +61,7 @@ nohup env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -u \
 
 training_pid=$!
 echo "$training_pid" > "$PID_FILE"
-echo "Jackaroo started with PID $training_pid using $environment_count environments."
+echo "Jackaroo started with PID $training_pid using a 16-match flight."
 echo "Checkpoint: $CHECKPOINT"
 echo "Log: $LOG"
 echo "Follow the log with: tail -f runs/jackaroo.stdout.log"

@@ -5,12 +5,14 @@
 
 #include "environment.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "game_env.hpp"
+#include "replay.hpp"
 
 namespace {
 
@@ -103,8 +105,23 @@ TrainingEnvironment::~TrainingEnvironment() = default;
 TrainingObservation TrainingEnvironment::Reset(std::uint32_t seed,
                                                bool left_team) {
   left_team_ = left_team;
-  scenario_->left_agents = left_team ? kGFootballPlayersPerTeam : 0;
-  scenario_->right_agents = left_team ? 0 : kGFootballPlayersPerTeam;
+  ResetMatch(seed, left_team ? kGFootballPlayersPerTeam : 0,
+             left_team ? 0 : kGFootballPlayersPerTeam);
+  return Observe(left_team_);
+}
+
+TrainingObservationPair TrainingEnvironment::ResetSelfPlay(std::uint32_t seed) {
+  ResetMatch(seed, kGFootballPlayersPerTeam, kGFootballPlayersPerTeam);
+  return {Observe(true), Observe(false)};
+}
+
+void TrainingEnvironment::ResetMatch(std::uint32_t seed, int left_agents,
+                                     int right_agents) {
+  if (recording_game_active_) {
+    throw std::runtime_error("cannot reset before the recorded match ends");
+  }
+  scenario_->left_agents = left_agents;
+  scenario_->right_agents = right_agents;
   scenario_->game_engine_random_seed = seed;
   environment_->reset(*scenario_, false);
   while (true) {
@@ -119,46 +136,103 @@ TrainingObservation TrainingEnvironment::Reset(std::uint32_t seed,
       environment_->step();
     }
   }
-  return Observe();
+  if (replay_writer_) {
+    replay_writer_->BeginGame(seed, environment_->get_state(""));
+    recording_game_active_ = true;
+  }
+}
+
+GFootballModelDecision TrainingEnvironment::ApplyDecision(
+    bool left_team, const TrainingDecision& actions) {
+  const SharedInfo state = environment_->get_info();
+  const auto& physical_team = left_team ? state.left_team : state.right_team;
+  GFootballModelDecision decision{};
+  for (int index = 0; index < kGFootballPlayersPerTeam; ++index) {
+    const int action = actions[index];
+    if (action < game_idle || action > game_delegate) {
+      throw std::out_of_range("decision action must be in [0, 32]");
+    }
+    if (action != game_delegate && !physical_team.at(index).is_active) {
+      throw std::invalid_argument("decision targets an inactive player");
+    }
+    decision.actions[index] = left_team ? action : OppositeDirection(action);
+  }
+  environment_->apply_model_decision(left_team, decision);
+  return decision;
 }
 
 // Applies one complete model-interface decision and advances one 100 ms step.
-TrainingObservation TrainingEnvironment::Step(
-    const std::array<std::int32_t, kGFootballPlayersPerTeam>& actions) {
+TrainingObservation TrainingEnvironment::Step(const TrainingDecision& actions) {
   {
     ContextHolder context(environment_.get());
-    const SharedInfo state = environment_->get_info();
-    if (state.is_in_play) {
-      GFootballModelDecision decision{};
-      const auto& physical_team =
-          left_team_ ? state.left_team : state.right_team;
-      for (int index = 0; index < kGFootballPlayersPerTeam; ++index) {
-        const int action = actions[index];
-        if (action < game_idle || action > game_delegate) {
-          throw std::out_of_range("decision action must be in [0, 32]");
+    const SharedInfo before = environment_->get_info();
+    if (before.is_in_play) {
+      const GFootballModelDecision decision =
+          ApplyDecision(left_team_, actions);
+      if (replay_writer_) {
+        ReplayStep step;
+        step.step = before.step;
+        for (auto& team : step.decisions) {
+          std::fill(std::begin(team.actions), std::end(team.actions),
+                    game_delegate);
         }
-        if (action != game_delegate && !physical_team.at(index).is_active) {
-          throw std::invalid_argument("decision targets an inactive player");
-        }
-        decision.actions[index] = left_team_ ? action
-                                             : OppositeDirection(action);
+        step.decisions[left_team_ ? 0 : 1] = decision;
+        replay_writer_->Record(step);
       }
-      environment_->apply_model_decision(left_team_, decision);
     }
     environment_->step();
   }
-  return Observe();
+  TrainingObservation observation = Observe(left_team_);
+  if (recording_game_active_ && observation.step >= maximum_steps_) {
+    ContextHolder context(environment_.get());
+    const SharedInfo final_state = environment_->get_info();
+    replay_writer_->FinishGame(
+        final_state.step,
+        {final_state.left_goals, final_state.right_goals});
+    recording_game_active_ = false;
+  }
+  return observation;
+}
+
+TrainingObservationPair TrainingEnvironment::StepSelfPlay(
+    const TrainingDecisionPair& actions) {
+  {
+    ContextHolder context(environment_.get());
+    if (environment_->get_info().is_in_play) {
+      ApplyDecision(true, actions[0]);
+      ApplyDecision(false, actions[1]);
+    }
+    environment_->step();
+  }
+  return {Observe(true), Observe(false)};
+}
+
+void TrainingEnvironment::StartRecording(const std::filesystem::path& path) {
+  if (replay_writer_) {
+    throw std::runtime_error("recording is already active");
+  }
+  replay_writer_ = std::make_unique<ReplayWriter>(path);
+}
+
+void TrainingEnvironment::FinishRecording() {
+  if (!replay_writer_) {
+    throw std::runtime_error("recording has not started");
+  }
+  if (recording_game_active_) {
+    throw std::runtime_error("cannot finish recording before the match ends");
+  }
+  replay_writer_->Finish();
 }
 
 // Copies the public model-interface observation without adding training-only
 // state. This keeps the policy input identical to an external model's input.
-TrainingObservation TrainingEnvironment::Observe() {
+TrainingObservation TrainingEnvironment::Observe(bool left_team) {
   ContextHolder context(environment_.get());
   const SharedInfo state = environment_->get_info();
   TrainingObservation observation{};
-  const int own_side = left_team_ ? 0 : 1;
+  const int own_side = left_team ? 0 : 1;
   const int opponent_side = 1 - own_side;
-  const float rotation = left_team_ ? 1.0f : -1.0f;
+  const float rotation = left_team ? 1.0f : -1.0f;
   auto copy_canonical = [rotation](const Position& source,
                                    float destination[3]) {
     destination[0] = rotation * source.env_coord(0);
@@ -213,8 +287,8 @@ TrainingObservation TrainingEnvironment::Observe() {
         source_team.designated_possession_player;
     target_team.time_to_ball_ms = source_team.time_to_ball_ms;
   }
-  observation.goals[0] = left_team_ ? state.left_goals : state.right_goals;
-  observation.goals[1] = left_team_ ? state.right_goals : state.left_goals;
+  observation.goals[0] = left_team ? state.left_goals : state.right_goals;
+  observation.goals[1] = left_team ? state.right_goals : state.left_goals;
   observation.game_mode = state.game_mode;
   observation.set_piece_team = state.set_piece_team < 0
       ? -1
@@ -238,9 +312,9 @@ TrainingObservation TrainingEnvironment::Observe() {
   for (int player = 0; player < kGFootballPlayersPerTeam; ++player) {
     for (int index = 0; index < kGFootballStickyActionCount; ++index) {
       int physical_action = sticky_actions[index];
-      if (!left_team_) physical_action = OppositeDirection(physical_action);
+      if (!left_team) physical_action = OppositeDirection(physical_action);
       observation.sticky_actions[player][index] =
-          environment_->sticky_action_state(physical_action, left_team_,
+          environment_->sticky_action_state(physical_action, left_team,
                                              player);
     }
   }

@@ -11,7 +11,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 from .attention import PLAYER_ACTIVE_INDEX, TensorFrame, batch_tensor_frames, tensorize
-from .env import VectorFootballEnv
+from .env import SelfPlayVectorFootballEnv
 from .network import ActorCritic, RecurrentState
 
 
@@ -171,41 +171,58 @@ def _pack_rollout(
     )
 
 
-def collect_vector_rollout(
-    environment: VectorFootballEnv,
+def collect_self_play_rollout(
+    environment: SelfPlayVectorFootballEnv,
     policy: ActorCritic,
-    observations: list[dict],
-    steps: int,
+    games: int,
     sequence_length: int = 32,
     progress: Callable[[str], None] | None = None,
-) -> tuple[Rollout, list[dict], list[tuple[int, int]], list[tuple[int, int]]]:
-    """Collect complete scored segments and retain their causal state sequence."""
+) -> tuple[
+    Rollout,
+    list[tuple[int, int]],
+    list[tuple[int, int]],
+]:
+    """Collect scored segments from full shared-policy self-play matches."""
 
-    if steps <= 0 or sequence_length <= 0:
-        raise ValueError("rollout steps and sequence length must be positive")
-    if len(observations) != environment.count:
-        raise ValueError("one observation is required per environment")
+    if games <= 0 or sequence_length <= 0:
+        raise ValueError("rollout games and sequence length must be positive")
+    first_flight_size = min(environment.count, games)
+    observations = environment.reset(first_flight_size)
     device = next(policy.parameters()).device
-    recurrent = policy.initial_state(environment.count, device)
-    pending: list[list[_Transition]] = [[] for _ in range(environment.count)]
+    agent_count = 2 * environment.count
+    recurrent = policy.initial_state(agent_count, device)
+    pending: list[list[_Transition]] = [[] for _ in range(agent_count)]
     retained: list[_Segment] = []
     completed_segments: list[tuple[int, int]] = []
     completed_matches: list[tuple[int, int]] = []
-    retained_steps = simulated_steps = wave = 0
-    report_interval = max(environment.count, min(512, max(steps // 8, 1)))
+    simulated_steps = flight = 0
+    report_interval = max(500 * environment.count, 1)
     next_report = report_interval
     policy.eval()
 
-    while retained_steps < steps:
-        wave += 1
-        active = [True] * environment.count
+    while len(completed_matches) < games:
+        flight += 1
+        flight_size = min(environment.count, games - len(completed_matches))
+        if flight > 1:
+            for index in range(flight_size):
+                observations[index] = environment.reset_one(index)
+        active = [index < flight_size for index in range(environment.count)]
+        if progress is not None:
+            progress(
+                f"flight={flight} start matches={len(completed_matches)}/{games} "
+                f"active={flight_size}"
+            )
         while any(active):
-            decision_indices = [
-                index for index in range(environment.count)
-                if active[index] and observations[index]["is_in_play"]
-            ]
-            frames = [tensorize(observations[index]) for index in decision_indices]
-            actions = [0] * environment.count
+            decision_indices: list[int] = []
+            frames: list[TensorFrame] = []
+            for environment_index in range(environment.count):
+                if not active[environment_index]:
+                    continue
+                for side in range(2):
+                    if observations[environment_index][side]["is_in_play"]:
+                        decision_indices.append(2 * environment_index + side)
+                        frames.append(tensorize(observations[environment_index][side]))
+            actions = [[0, 0] for _ in range(environment.count)]
             decisions: dict[
                 int, tuple[TensorFrame, RecurrentState | None, int, float, float]
             ] = {}
@@ -217,10 +234,11 @@ def collect_vector_rollout(
                     sampled = distribution.sample()
                     log_probability = distribution.log_prob(sampled)
                 recurrent = _put_state(recurrent, decision_indices, output.state)
-                for local, environment_index in enumerate(decision_indices):
+                for local, agent_index in enumerate(decision_indices):
                     action = int(sampled[local])
-                    actions[environment_index] = action
-                    sequence_start = len(pending[environment_index]) % sequence_length == 0
+                    environment_index, side = divmod(agent_index, 2)
+                    actions[environment_index][side] = action
+                    sequence_start = len(pending[agent_index]) % sequence_length == 0
                     saved_state = (
                         RecurrentState(
                             before.entities[local:local + 1].cpu(),
@@ -228,7 +246,7 @@ def collect_vector_rollout(
                         )
                         if sequence_start else None
                     )
-                    decisions[environment_index] = (
+                    decisions[agent_index] = (
                         frames[local],
                         saved_state,
                         action,
@@ -236,57 +254,81 @@ def collect_vector_rollout(
                         float(output.value[local]),
                     )
 
-            next_observations, _, segment_done, infos = environment.step(actions, active)
-            for index in range(environment.count):
-                if not active[index]:
+            next_observations, results, segment_done, infos = environment.step(
+                actions, active
+            )
+            simulated_steps += sum(active)
+            for environment_index in range(environment.count):
+                if not active[environment_index]:
                     continue
-                if infos[index]["action_applied"]:
-                    frame, before, action, log_probability, value = decisions[index]
-                    pending[index].append(
-                        _Transition(
-                            frame, tensorize(next_observations[index]), before,
-                            action, log_probability, value,
+                for side in range(2):
+                    agent_index = 2 * environment_index + side
+                    if infos[environment_index]["action_applied"][side]:
+                        frame, before, action, log_probability, value = decisions[
+                            agent_index
+                        ]
+                        pending[agent_index].append(
+                            _Transition(
+                                frame,
+                                tensorize(next_observations[environment_index][side]),
+                                before,
+                                action,
+                                log_probability,
+                                value,
+                            )
                         )
-                    )
-                    simulated_steps += 1
-                if segment_done[index]:
-                    result = infos[index]["segment_result"]
+                if segment_done[environment_index]:
+                    left_result = infos[environment_index]["segment_result"]
+                    result = results[environment_index]
+                    if left_result != result:
+                        raise RuntimeError("self-play segment result is inconsistent")
                     if result not in (-1, 0, 1):
                         raise RuntimeError("completed segment has no WDL result")
-                    if not pending[index]:
-                        raise RuntimeError("a completed segment has no policy decision")
-                    pending[index][-1].next_frame = tensorize(next_observations[index])
-                    pending[index][-1].terminal_class = (
-                        1 if result == 1 else 2 if result == -1 else 0
+                    completed_segments.append(
+                        (int(result), infos[environment_index]["segment_steps"])
                     )
-                    completed_segments.append((int(result), infos[index]["segment_steps"]))
                     if result:
-                        retained.append(_Segment(pending[index], int(result)))
-                        retained_steps += len(pending[index])
-                    pending[index] = []
-                    recurrent = _clear_state(recurrent, index)
-                    active[index] = False
-                    if infos[index]["match_done"]:
-                        completed_matches.append(tuple(infos[index]["goals"]))
-                        next_observations[index] = environment.reset_one(index)
+                        for side, side_result in ((0, result), (1, -result)):
+                            agent_index = 2 * environment_index + side
+                            if not pending[agent_index]:
+                                raise RuntimeError(
+                                    "a scored self-play segment has no policy decision"
+                                )
+                            pending[agent_index][-1].next_frame = tensorize(
+                                next_observations[environment_index][side]
+                            )
+                            pending[agent_index][-1].terminal_class = (
+                                1 if side_result == 1 else 2
+                            )
+                            retained.append(
+                                _Segment(pending[agent_index], int(side_result))
+                            )
+                    for side in range(2):
+                        agent_index = 2 * environment_index + side
+                        pending[agent_index] = []
+                        recurrent = _clear_state(recurrent, agent_index)
+                    if infos[environment_index]["match_done"]:
+                        completed_matches.append(
+                            tuple(infos[environment_index]["goals"])
+                        )
+                        active[environment_index] = False
             observations = next_observations
             if progress is not None and simulated_steps >= next_report:
                 progress(
-                    f"steps={retained_steps} target={steps} simulated={simulated_steps} "
-                    f"wave={wave} active={sum(active)}/{environment.count} "
-                    f"segments={len(completed_segments)} matches={len(completed_matches)}"
+                    f"flight={flight} matches={len(completed_matches)}/{games} "
+                    f"engine_steps={simulated_steps} active={sum(active)}/{flight_size} "
+                    f"segments={len(completed_segments)} scored={len(retained) // 2}"
                 )
                 next_report += report_interval
         if progress is not None:
             progress(
-                f"wave={wave} complete steps={retained_steps} target={steps} "
-                f"simulated={simulated_steps} segments={len(completed_segments)} "
-                f"matches={len(completed_matches)}"
+                f"flight={flight} complete matches={len(completed_matches)}/{games} "
+                f"engine_steps={simulated_steps} segments={len(completed_segments)} "
+                f"scored={len(retained) // 2}"
             )
 
     return (
         _pack_rollout(retained, sequence_length, device),
-        observations,
         completed_segments,
         completed_matches,
     )

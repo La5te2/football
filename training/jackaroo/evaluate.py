@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 
@@ -19,8 +19,9 @@ def evaluate_policy(
     games: int,
     seed: int,
     progress: Callable[[str], None] | None = None,
-) -> dict[str, float]:
-    """Evaluate one policy over complete matches and next-goal episodes."""
+    record_path: Path | None = None,
+) -> dict[str, Any]:
+    """Evaluate complete matches against built-in AI from paired seeds."""
 
     if games < 0:
         raise ValueError("games must be nonnegative")
@@ -30,19 +31,21 @@ def evaluate_policy(
             "draws": 0.0,
             "losses": 0.0,
             "goal_difference": 0.0,
-            "segment_wins": 0.0,
-            "segment_draws": 0.0,
-            "segment_losses": 0.0,
-            "mean_segment_steps": 0.0,
+            "scores": [],
         }
 
     device = next(policy.parameters()).device
     environment = FootballEnv(maximum_steps, seed)
+    if record_path is not None:
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        environment.start_recording(record_path)
     wins = draws = losses = goal_difference = 0
-    segment_wins = segment_draws = segment_losses = segment_steps = 0
+    scores: list[tuple[int, int]] = []
     policy.eval()
     for game in range(games):
-        observation = environment.reset((seed + game // 2) & 0xFFFFFFFF)
+        observation = environment.reset(
+            (seed + game // 2) & 0xFFFFFFFF, left_team=game % 2 == 0
+        )
         state = policy.initial_state(1, device)
         match_done = False
         info = {"goals": (0, 0)}
@@ -59,11 +62,6 @@ def evaluate_policy(
                 action = output.logits[0].argmax().item()
             observation, _, segment_done, info = environment.step(action)
             if segment_done:
-                result = info["segment_result"]
-                segment_wins += result == 1
-                segment_draws += result == 0
-                segment_losses += result == -1
-                segment_steps += info["segment_steps"]
                 state = policy.initial_state(1, device)
             match_done = info["match_done"]
             if progress is not None and observation["step"] >= next_progress_step:
@@ -75,6 +73,7 @@ def evaluate_policy(
                 )
                 next_progress_step += 500
         goals = tuple(info["goals"])
+        scores.append(goals)
         if progress is not None:
             progress(
                 f"game={game + 1}/{games} complete "
@@ -85,16 +84,14 @@ def evaluate_policy(
         draws += own == opponent
         losses += own < opponent
         goal_difference += own - opponent
-    segment_count = segment_wins + segment_draws + segment_losses
+    if record_path is not None:
+        environment.finish_recording()
     return {
         "wins": float(wins),
         "draws": float(draws),
         "losses": float(losses),
         "goal_difference": goal_difference / games,
-        "segment_wins": float(segment_wins),
-        "segment_draws": float(segment_draws),
-        "segment_losses": float(segment_losses),
-        "mean_segment_steps": segment_steps / segment_count,
+        "scores": scores,
     }
 
 
@@ -104,6 +101,7 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--record", type=Path)
     arguments = parser.parse_args()
     if arguments.games <= 0:
         raise ValueError("games must be positive")
@@ -134,14 +132,13 @@ def main() -> None:
         arguments.games,
         arguments.seed,
         progress=print,
+        record_path=arguments.record,
     )
     print(
         f"summary matches={int(metrics['wins'])}/{int(metrics['draws'])}/"
         f"{int(metrics['losses'])} "
         f"mean_goal_difference={metrics['goal_difference']:.3f} "
-        f"segments={int(metrics['segment_wins'])}/"
-        f"{int(metrics['segment_draws'])}/{int(metrics['segment_losses'])} "
-        f"mean_segment_steps={metrics['mean_segment_steps']:.1f}"
+        f"scores={' '.join(f'{left}:{right}' for left, right in metrics['scores'])}"
     )
 
 

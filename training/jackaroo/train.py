@@ -9,11 +9,11 @@ from typing import Any
 
 import torch
 
-from .env import FootballEnv, VectorFootballEnv
+from .env import FootballEnv, SelfPlayVectorFootballEnv
 from .evaluate import evaluate_policy
 from .features import encode
 from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
-from .ppo import collect_vector_rollout, update
+from .ppo import collect_self_play_rollout, update
 
 
 def _status(message: str) -> None:
@@ -23,8 +23,8 @@ def _status(message: str) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--updates", type=int, default=1000)
-    parser.add_argument("--steps-per-update", type=int, default=2048)
-    parser.add_argument("--environments", type=int, default=8)
+    parser.add_argument("--games-per-update", type=int, default=256)
+    parser.add_argument("--flight", type=int, default=16)
     parser.add_argument("--maximum-steps", type=int, default=3000)
     parser.add_argument("--sequence-length", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -39,8 +39,10 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--log", type=Path)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--evaluation-interval", type=int, default=50)
-    parser.add_argument("--evaluation-games", type=int, default=2)
+    parser.add_argument("--validation-seed", type=int, default=42)
+    parser.add_argument(
+        "--validation-directory", type=Path, default=Path("runs/validation")
+    )
     return parser.parse_args()
 
 
@@ -59,14 +61,12 @@ def _append_log(path: Path, record: dict[str, Any]) -> None:
 
 def _validate_arguments(arguments: argparse.Namespace) -> None:
     positive = (
-        "updates", "steps_per_update", "environments", "maximum_steps",
-        "sequence_length", "ppo_epochs", "ppo_batch_size", "evaluation_interval",
+        "updates", "games_per_update", "flight", "maximum_steps",
+        "sequence_length", "ppo_epochs", "ppo_batch_size",
     )
     for name in positive:
         if getattr(arguments, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
-    if arguments.evaluation_games < 0:
-        raise ValueError("evaluation-games must be nonnegative")
     if arguments.learning_rate <= 0.0:
         raise ValueError("learning-rate must be positive")
     nonnegative = (
@@ -96,7 +96,8 @@ def main() -> None:
         torch.backends.cudnn.benchmark = True
     _status(
         f"startup device={device.type} updates={arguments.updates} "
-        f"environments={arguments.environments} seed={arguments.seed}"
+        f"flight={arguments.flight} games_per_update={arguments.games_per_update} "
+        f"seed={arguments.seed}"
     )
 
     bootstrap_environment = FootballEnv(arguments.maximum_steps, arguments.seed)
@@ -118,6 +119,7 @@ def main() -> None:
             "action_count": action_count,
             "maximum_steps": arguments.maximum_steps,
             "sequence_length": arguments.sequence_length,
+            "seed": arguments.seed,
             "objective": POLICY_OBJECTIVE,
         }
         for name, value in expected.items():
@@ -133,27 +135,30 @@ def main() -> None:
     optimizer = torch.optim.Adam(policy.parameters(), lr=arguments.learning_rate)
     if checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
-    environment = VectorFootballEnv(
-        arguments.environments,
+    environment = SelfPlayVectorFootballEnv(
+        arguments.flight,
         arguments.maximum_steps,
         arguments.seed,
-        fixed_seed=arguments.seed,
     )
-    observations = environment.reset()
+    sampled_matches = int(checkpoint.get("sampled_matches", 0))
+    environment.advance_seed_sequence(sampled_matches)
     _status(
-        f"vector-environment count={arguments.environments} fixed_seed={arguments.seed} ready"
+        f"self-play flight={arguments.flight} seed_sequence={arguments.seed} ready"
     )
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
-        _status(f"update={iteration} rollout start target_steps={arguments.steps_per_update}")
-        rollout, observations, segments, matches = collect_vector_rollout(
+        _status(
+            f"update={iteration} rollout start "
+            f"target_games={arguments.games_per_update}"
+        )
+        rollout, segments, matches = collect_self_play_rollout(
             environment,
             policy,
-            observations,
-            arguments.steps_per_update,
+            arguments.games_per_update,
             sequence_length=arguments.sequence_length,
             progress=lambda message: _status(f"update={iteration} rollout {message}"),
         )
+        sampled_matches += len(matches)
         _status(f"update={iteration} ppo start")
         losses = update(
             policy,
@@ -170,42 +175,52 @@ def main() -> None:
         action_counts = torch.bincount(
             rollout.actions[rollout.valid].detach().cpu(), minlength=action_count
         ).float()
-        segment_wins = sum(result == 1 for result, _ in segments)
+        left_scoring_segments = sum(result == 1 for result, _ in segments)
         censored_segments = sum(result == 0 for result, _ in segments)
-        segment_losses = sum(result == -1 for result, _ in segments)
+        right_scoring_segments = sum(result == -1 for result, _ in segments)
         retained_segments = [segment for segment in segments if segment[0] != 0]
         mean_segment_steps = sum(length for _, length in retained_segments) / max(
             len(retained_segments), 1
         )
         diagnostics = {
             "action_distribution": (action_counts / action_counts.sum()).tolist(),
-            "reward_total": rollout.reward_total,
             "transition_count": rollout.transition_count,
-            "segment_wins": segment_wins,
-            "segment_losses": segment_losses,
+            "left_scoring_segments": left_scoring_segments,
+            "right_scoring_segments": right_scoring_segments,
+            "policy_segments": 2 * (
+                left_scoring_segments + right_scoring_segments
+            ),
             "censored_segments": censored_segments,
             "mean_segment_steps": mean_segment_steps,
         }
-        evaluation: dict[str, float] = {}
-        if arguments.evaluation_games and iteration % arguments.evaluation_interval == 0:
-            _status(f"update={iteration} evaluation start")
-            evaluation = evaluate_policy(
-                policy,
-                arguments.maximum_steps,
-                arguments.evaluation_games,
-                arguments.seed + 1_000_000,
-                progress=lambda message: _status(f"update={iteration} evaluation {message}"),
-            )
-        scores = " ".join(f"{left}:{right}" for left, right in matches) or "-"
+        _status(f"update={iteration} validation seed={arguments.validation_seed} start")
+        evaluation = evaluate_policy(
+            policy,
+            arguments.maximum_steps,
+            2,
+            arguments.validation_seed,
+            progress=lambda message: _status(f"update={iteration} validation {message}"),
+            record_path=(
+                arguments.validation_directory / f"update-{iteration:06d}.gfr"
+            ),
+        )
+        total_left_goals = sum(left for left, _ in matches)
+        total_right_goals = sum(right for _, right in matches)
+        validation_scores = " ".join(
+            f"{left}:{right}" for left, right in evaluation["scores"]
+        )
         print(
-            f"update={iteration} matches={scores} "
-            f"segments={segment_wins}/{segment_losses} censored={censored_segments} "
+            f"update={iteration} self_play_matches={len(matches)} "
+            f"self_play_goals={total_left_goals}:{total_right_goals} "
+            f"goal_segments={left_scoring_segments}:{right_scoring_segments} "
+            f"policy_segments={2 * (left_scoring_segments + right_scoring_segments)} "
+            f"tails={censored_segments} "
             f"segment_steps={mean_segment_steps:.1f} policy={losses['policy']:.4f} "
             f"value={losses['value']:.4f} entropy={losses['entropy']:.4f} "
             f"transition={losses['outcome'] + losses['terminal'] + losses['latent']:.4f} "
             f"q={losses['action_value']:.4f} control={losses['control']:.4f} "
             f"kl={losses['kl']:.5f} clipped={losses['clip_fraction']:.4f} "
-            f"reward={rollout.reward_total:.3f}",
+            f"validation={validation_scores}",
             flush=True,
         )
         checkpoint = {
@@ -216,7 +231,9 @@ def main() -> None:
             "action_count": action_count,
             "maximum_steps": arguments.maximum_steps,
             "sequence_length": arguments.sequence_length,
-            "environments": arguments.environments,
+            "flight": arguments.flight,
+            "games_per_update": arguments.games_per_update,
+            "sampled_matches": sampled_matches,
             "seed": arguments.seed,
             "ppo_epochs": arguments.ppo_epochs,
             "ppo_batch_size": arguments.ppo_batch_size,

@@ -1,4 +1,4 @@
-"""Python wrappers for the native single-agent football environments."""
+"""Python wrappers for native single-agent and self-play football matches."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from . import _gfootball_env as native
 
 
 Observation = dict[str, Any]
+ObservationPair = tuple[Observation, Observation]
 
 
 def _goal_result(previous: Observation, current: Observation) -> int:
@@ -48,11 +49,14 @@ class FootballEnv:
         self._observation: Observation | None = None
         self._segment_action_count = 0
 
-    def reset(self, seed: int | None = None) -> Observation:
+    def reset(
+        self, seed: int | None = None, left_team: bool | None = None
+    ) -> Observation:
         if seed is None:
             seed = self._seed_generator.getrandbits(32)
-        left_team = self._next_left_team
-        self._next_left_team = not self._next_left_team
+        if left_team is None:
+            left_team = self._next_left_team
+            self._next_left_team = not self._next_left_team
         self._observation = native.reset(
             self._native, seed & 0xFFFFFFFF, left_team
         )
@@ -90,6 +94,12 @@ class FootballEnv:
             self._segment_action_count = 0
         return current, float(result), segment_done, info
 
+    def start_recording(self, path: str | Path) -> None:
+        native.start_recording(self._native, str(Path(path)))
+
+    def finish_recording(self) -> None:
+        native.finish_recording(self._native)
+
 
 class VectorFootballEnv:
     """Concurrent headless matches with Python-side reward calculation."""
@@ -101,7 +111,6 @@ class VectorFootballEnv:
         count: int,
         maximum_steps: int = 3000,
         seed: int | None = None,
-        fixed_seed: int | None = None,
     ) -> None:
         if count <= 0:
             raise ValueError("environment count must be positive")
@@ -109,9 +118,6 @@ class VectorFootballEnv:
         self.count = count
         self.maximum_steps = maximum_steps
         self._seed_generator = random.Random(seed)
-        self._fixed_seed = (
-            None if fixed_seed is None else int(fixed_seed) & 0xFFFFFFFF
-        )
         self._used_seeds: set[int] = set()
         self._next_left_team = [index % 2 == 0 for index in range(count)]
         self._native = native.create_batch(str(data), str(font), maximum_steps, count)
@@ -119,8 +125,6 @@ class VectorFootballEnv:
         self._segment_action_counts = [0] * count
 
     def _seed(self) -> int:
-        if self._fixed_seed is not None:
-            return self._fixed_seed
         while True:
             seed = self._seed_generator.getrandbits(32)
             if seed not in self._used_seeds:
@@ -218,3 +222,151 @@ class VectorFootballEnv:
                 self._segment_action_counts[index] = 0
         self._observations = observations
         return observations, rewards, segment_done, infos
+
+
+class SelfPlayVectorFootballEnv:
+    """Concurrent matches in which one shared policy controls both teams."""
+
+    action_count = native.ENGINE_ACTION_COUNT
+
+    def __init__(
+        self, count: int, maximum_steps: int = 3000, seed: int | None = None
+    ) -> None:
+        if count <= 0:
+            raise ValueError("environment count must be positive")
+        data, font = _native_paths()
+        self.count = count
+        self.maximum_steps = maximum_steps
+        self._seed_generator = random.Random(seed)
+        self._used_seeds: set[int] = set()
+        self._native = native.create_batch(str(data), str(font), maximum_steps, count)
+        self._observations: list[ObservationPair] = []
+        self._segment_action_counts = [0] * count
+
+    def _seed(self) -> int:
+        while True:
+            seed = self._seed_generator.getrandbits(32)
+            if seed not in self._used_seeds:
+                self._used_seeds.add(seed)
+                return seed
+
+    def advance_seed_sequence(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("seed sequence advance must be nonnegative")
+        for _ in range(count):
+            self._seed()
+
+    def reset(self, active_count: int | None = None) -> list[ObservationPair]:
+        if active_count is None:
+            active_count = self.count
+        if not 0 < active_count <= self.count:
+            raise ValueError("active environment count is out of range")
+        seeds = [self._seed() for _ in range(active_count)]
+        seeds.extend([0] * (self.count - active_count))
+        self._observations = [
+            tuple(pair) for pair in native.reset_self_play_batch(self._native, seeds)
+        ]
+        self._segment_action_counts = [0] * self.count
+        return self._observations
+
+    def reset_one(self, index: int) -> ObservationPair:
+        if not 0 <= index < self.count:
+            raise IndexError("environment index is out of range")
+        pair = tuple(
+            native.reset_self_play_batch_one(self._native, index, self._seed())
+        )
+        self._observations[index] = pair
+        self._segment_action_counts[index] = 0
+        return pair
+
+    def step(
+        self,
+        actions: Sequence[Sequence[int]],
+        active: Sequence[bool] | None = None,
+    ) -> tuple[
+        list[ObservationPair], list[int], list[bool], list[dict[str, Any]]
+    ]:
+        """Advance each active match after receiving both teams' actions."""
+
+        if len(actions) != self.count:
+            raise ValueError("one action pair is required per environment")
+        active_flags = [True] * self.count if active is None else list(active)
+        if len(active_flags) != self.count:
+            raise ValueError("one activity flag is required per environment")
+        decisions: list[list[list[int]]] = []
+        for index, pair in enumerate(actions):
+            if len(pair) != 2:
+                raise ValueError("each self-play action must contain two teams")
+            team_decisions: list[list[int]] = []
+            for side, action in enumerate(pair):
+                if not 0 <= action < self.action_count:
+                    raise ValueError(
+                        f"action must be in [0, {self.action_count - 1}]"
+                    )
+                decision = [native.ENGINE_ACTION_COUNT] * 11
+                previous = self._observations[index][side]
+                player = previous["team_state"][0][
+                    "designated_possession_player"
+                ]
+                if 0 <= player < 11 and previous["teams"][0][player]["is_active"]:
+                    decision[player] = int(action)
+                team_decisions.append(decision)
+            decisions.append(team_decisions)
+
+        previous_observations = self._observations
+        native_results = native.step_self_play_batch(
+            self._native, decisions, active_flags
+        )
+        observations = [tuple(result[0]) for result in native_results]
+        match_done = [bool(result[1]) for result in native_results]
+        results: list[int] = []
+        segment_done: list[bool] = []
+        infos: list[dict[str, Any]] = []
+        for index, current in enumerate(observations):
+            if not active_flags[index]:
+                results.append(0)
+                segment_done.append(False)
+                infos.append(
+                    {
+                        "goals": current[0]["goals"],
+                        "step": current[0]["step"],
+                        "segment_result": None,
+                        "segment_steps": 0,
+                        "match_done": match_done[index],
+                        "action_applied": (False, False),
+                    }
+                )
+                continue
+            left_result = _goal_result(
+                previous_observations[index][0], current[0]
+            )
+            right_result = _goal_result(
+                previous_observations[index][1], current[1]
+            )
+            if right_result != -left_result:
+                raise RuntimeError("self-play observations disagree about the goal")
+            applied = tuple(
+                bool(previous_observations[index][side]["is_in_play"])
+                for side in range(2)
+            )
+            if any(applied):
+                self._segment_action_counts[index] += 1
+            ended = left_result != 0 or match_done[index]
+            results.append(left_result)
+            segment_done.append(ended)
+            infos.append(
+                {
+                    "goals": current[0]["goals"],
+                    "step": current[0]["step"],
+                    "segment_result": left_result if ended else None,
+                    "segment_steps": (
+                        self._segment_action_counts[index] if ended else 0
+                    ),
+                    "match_done": match_done[index],
+                    "action_applied": applied,
+                }
+            )
+            if ended:
+                self._segment_action_counts[index] = 0
+        self._observations = observations
+        return observations, results, segment_done, infos

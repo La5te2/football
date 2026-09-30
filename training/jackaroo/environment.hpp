@@ -12,11 +12,16 @@
 #include "interface.hpp"
 
 class GameEnv;
+class ReplayWriter;
 struct ScenarioConfig;
 
 using TrainingObservation = GFootballModelObservation;
+using TrainingObservationPair = std::array<TrainingObservation, 2>;
+using TrainingDecision =
+    std::array<std::int32_t, kGFootballPlayersPerTeam>;
+using TrainingDecisionPair = std::array<TrainingDecision, 2>;
 
-// Owns one headless model-versus-built-in-AI training simulation.
+// Owns one headless simulation used for single-agent evaluation or self-play.
 class TrainingEnvironment {
  public:
   TrainingEnvironment(const std::filesystem::path& data_directory,
@@ -25,15 +30,23 @@ class TrainingEnvironment {
   ~TrainingEnvironment();
 
   TrainingObservation Reset(std::uint32_t seed, bool left_team);
-  TrainingObservation Step(
-      const std::array<std::int32_t, kGFootballPlayersPerTeam>& actions);
+  TrainingObservationPair ResetSelfPlay(std::uint32_t seed);
+  TrainingObservation Step(const TrainingDecision& actions);
+  TrainingObservationPair StepSelfPlay(const TrainingDecisionPair& actions);
+  void StartRecording(const std::filesystem::path& path);
+  void FinishRecording();
   int maximum_steps() const { return maximum_steps_; }
 
  private:
-  TrainingObservation Observe();
+  void ResetMatch(std::uint32_t seed, int left_agents, int right_agents);
+  GFootballModelDecision ApplyDecision(bool left_team,
+                                       const TrainingDecision& actions);
+  TrainingObservation Observe(bool left_team);
   bool left_team_ = true;
   std::unique_ptr<GameEnv> environment_;
   std::unique_ptr<ScenarioConfig> scenario_;
+  std::unique_ptr<ReplayWriter> replay_writer_;
+  bool recording_game_active_ = false;
   int maximum_steps_;
 };
 

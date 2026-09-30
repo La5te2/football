@@ -2,7 +2,7 @@
 
 Jackaroo is a single-agent recurrent PPO policy for the next-goal objective. It controls the engine-designated player with one of the engine's 32 atomic actions while TeamAI and Eliza control the remaining players. Observations use canonical coordinates, so Jackaroo always attacks toward positive $x$ regardless of its physical side.
 
-The policy starts from random parameters and learns from scored segments produced by direct interaction with the engine. A segment begins at kickoff and ends at the next goal. Scoring and conceding produce $+1$ and $-1$ respectively; a scoreless final segment is retained in evaluation statistics and excluded from optimization.
+The policy starts from random parameters and learns through shared-policy self-play. A segment begins at kickoff and ends at the next goal. The scoring side receives $+1$, the conceding side receives $-1$, and both trajectories enter PPO as separate state-dependent action sequences. A scoreless final segment remains part of its complete match and is excluded from optimization.
 
 The network combines a 24-token entity Transformer, persistent per-entity and global recurrent state, a DSS-derived spatial-control field, a structured representation of the 32 actions, an action-conditioned transition model, and one next-goal EPV function. The same EPV is the PPO Critic and evaluates predicted action outcomes; there is no separate Q network.
 
@@ -34,13 +34,13 @@ Start the formal Linux background run from the repository root:
 bash training/jackaroo/run.sh
 ```
 
-The formal script uses up to 16 concurrent native environments, collects at least 8192 transitions from complete scored segments for each update, trains on contiguous sequences of 32 transitions, and performs four PPO epochs. It writes the process ID to `runs/jackaroo.pid`, the checkpoint to `runs/jackaroo.pt`, and console output to `runs/jackaroo.stdout.log`. Extra command-line arguments override the script defaults.
+The formal script runs flights of 16 concurrent matches. Each update collects 256 complete self-play matches, lets the shared Jackaroo policy decide for both teams at every engine step, retains every scored segment, trains on contiguous sequences of 32 transitions for four PPO epochs, and then plays two complete validation matches against built-in AI with seed 42 from opposite physical sides. It writes validation replays to `runs/validation`, the process ID to `runs/jackaroo.pid`, the checkpoint to `runs/jackaroo.pt`, and console output to `runs/jackaroo.stdout.log`. Extra command-line arguments override the script defaults.
 
 ```powershell
-python -m training.jackaroo.train --updates 1000 --steps-per-update 2048 --sequence-length 32 --ppo-epochs 4 --ppo-batch-size 256 --environments 8 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --transition-coefficient 0.1 --action-value-coefficient 0.1 --control-coefficient 0.05 --evaluation-interval 50 --evaluation-games 2 --device auto --seed 1 --checkpoint runs\jackaroo.pt
+python -m training.jackaroo.train --updates 1000 --games-per-update 256 --sequence-length 32 --ppo-epochs 4 --ppo-batch-size 256 --flight 16 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --transition-coefficient 0.1 --action-value-coefficient 0.1 --control-coefficient 0.05 --validation-seed 42 --validation-directory runs\validation --device auto --seed 1 --checkpoint runs\jackaroo.pt
 ```
 
-One run reuses `--seed` for every training match and alternates physical sides. Independent fixed seeds are used for evaluation. Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue from a compatible checkpoint.
+`--seed` initializes a deterministic sequence of unique 32-bit match seeds, so a run is reproducible while every self-play match receives its own seed. Validation always uses `--validation-seed` twice, once for each physical side. Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue from a compatible checkpoint.
 
 ## Evaluation
 
@@ -50,7 +50,7 @@ Evaluate a checkpoint through complete matches:
 python -m training.jackaroo.evaluate runs\jackaroo.pt --games 10 --device auto --seed 1
 ```
 
-Evaluation reports next-goal wins, draws, losses, mean segment length, complete-match results, and mean goal difference.
+Evaluation reports complete-match wins, draws, losses, scores, and mean goal difference. Add `--record runs\evaluation.gfr` to save all evaluated matches in one replay file.
 
 ## Exporting
 
