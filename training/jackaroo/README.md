@@ -1,14 +1,14 @@
 # Jackaroo
 
-Jackaroo is a single-agent football policy trained in three stages: built-in AI trajectory collection, behavior-cloning initialization, and PPO fine-tuning. The policy controls the engine-designated player against the built-in team and selects one of the engine's 32 atomic actions. Physical sides alternate between matches while every observation uses a canonical coordinate system in which the controlled team attacks toward positive $x$.
+Jackaroo is a single-agent recurrent PPO policy for the next-goal objective. It controls the engine-designated player with one of the engine's 32 atomic actions while TeamAI and Eliza control the remaining players. Observations use canonical coordinates, so Jackaroo always attacks toward positive $x$ regardless of its physical side.
 
-Every engine step returns the complete public model observation. The selected action is assigned to the designated player, and the remaining players use the engine's TeamAI and Eliza behavior. Formation, team behavior, set pieces, football rules, physics, and animation retain the engine defaults.
+The policy starts from random parameters and learns from scored segments produced by direct interaction with the engine. A segment begins at kickoff and ends at the next goal. Scoring and conceding produce $+1$ and $-1$ respectively; a scoreless final segment is retained in evaluation statistics and excluded from optimization.
 
-The policy represents both teams, the ball, and match context as 24 entity tokens. Player fatigue and other observable football state remain policy inputs, while absolute match time and the engine step only control the environment boundary. Three multi-head Transformer blocks model spatial relationships, while a two-layer GRU combines the latest observation frames before separate Actor and Critic heads predict the action distribution and state value.
+The network combines a 24-token entity Transformer, persistent per-entity and global recurrent state, a DSS-derived spatial-control field, a structured representation of the 32 actions, an action-conditioned transition model, and one next-goal EPV function. The same EPV is the PPO Critic and evaluates predicted action outcomes; there is no separate Q network.
 
 ## Building
 
-Build the native Python module with the Python environment containing PyTorch active on `PATH`:
+Build the native Python environment with the Python installation containing PyTorch active on `PATH`:
 
 ```powershell
 .\training\jackaroo\build.bat
@@ -22,46 +22,42 @@ bash training/jackaroo/build.sh
 
 ## Training
 
-Start the complete behavior-cloning and PPO process:
+Start a local training run:
 
 ```powershell
 python -m training.jackaroo.train
 ```
 
-On Linux, start the formal background run from the repository root:
+Start the formal Linux background run from the repository root:
 
 ```bash
 bash training/jackaroo/run.sh
 ```
 
-The script selects the system C++ runtime, validates the native environment, uses every valid action from 256 complete built-in AI matches for two behavior-cloning epochs, collects complete decisive next-goal episodes in parallel until each PPO update contains at least 8192 retained transitions, reuses them for four PPO epochs, uses up to 16 parallel environments, writes the process ID to `runs/jackaroo.pid`, and writes console output to `runs/jackaroo.stdout.log`. Additional arguments override its formal defaults.
-
-Running the Python module directly collects 128 built-in AI matches, performs two behavior-cloning epochs, then starts PPO with eight concurrent native environments. The default checkpoint is `runs/jackaroo.pt` and the compact per-update log is `runs/jackaroo.pt.jsonl`.
+The formal script uses up to 16 concurrent native environments, collects at least 8192 transitions from complete scored segments for each update, trains on contiguous sequences of 32 transitions, and performs four PPO epochs. It writes the process ID to `runs/jackaroo.pid`, the checkpoint to `runs/jackaroo.pt`, and console output to `runs/jackaroo.stdout.log`. Extra command-line arguments override the script defaults.
 
 ```powershell
-python -m training.jackaroo.train --imitation-games 128 --imitation-epochs 2 --updates 1000 --steps-per-update 2048 --ppo-epochs 4 --ppo-batch-size 256 --environments 8 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --evaluation-interval 50 --evaluation-games 2 --device auto --seed 1 --history-length 4 --checkpoint runs\jackaroo.pt
+python -m training.jackaroo.train --updates 1000 --steps-per-update 2048 --sequence-length 32 --ppo-epochs 4 --ppo-batch-size 256 --environments 8 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --transition-coefficient 0.1 --action-value-coefficient 0.1 --control-coefficient 0.05 --evaluation-interval 50 --evaluation-games 2 --device auto --seed 1 --checkpoint runs\jackaroo.pt
 ```
 
-Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue PPO from a checkpoint. Resume restores policy and optimizer state and skips behavior cloning.
-
-Behavior cloning uses every valid action in each complete teacher match and does not divide demonstrations at goals. PPO episodes start at kickoff and end when either team scores the next goal or the underlying match reaches full time. Scoring and conceding produce $+1$ and $-1$ respectively, while every non-terminal transition has zero reward. A full-time PPO episode without a goal remains in evaluation statistics but is excluded from PPO because it has no observed next-goal winner. Goals divide one continuous match into several PPO episodes while preserving its score, remaining time, random state, and team state. PPO assigns the completed episode's undiscounted result to every action in that episode and trains only on complete decisive episodes.
+One run reuses `--seed` for every training match and alternates physical sides. Independent fixed seeds are used for evaluation. Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue from a compatible checkpoint.
 
 ## Evaluation
 
-Evaluate a checkpoint through complete deterministic matches:
+Evaluate a checkpoint through complete matches:
 
 ```powershell
 python -m training.jackaroo.evaluate runs\jackaroo.pt --games 10 --device auto --seed 1
 ```
 
-Evaluation reports next-goal wins, draws, losses, mean episode length, complete-match results, and mean goal difference. Training also performs the same greedy evaluation every 50 PPO updates by default.
+Evaluation reports next-goal wins, draws, losses, mean segment length, complete-match results, and mean goal difference.
 
 ## Exporting
 
-Export the final policy as a TorchScript module without optimizer or training diagnostics:
+Export the recurrent policy as a TorchScript module:
 
 ```powershell
 python -m training.jackaroo.export runs\jackaroo.pt models\jackaroo\jackaroo.pt
 ```
 
-The exported `.pt` contains the policy computation graph and parameters, accepts the same encoded observation history used during training, and can be loaded by a native LibTorch model plugin.
+The exported module accepts one encoded public observation plus persistent entity and global states, then returns action logits, EPV, and the updated states for native inference.

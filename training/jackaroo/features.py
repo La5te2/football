@@ -59,7 +59,6 @@ def encode(observation: Observation) -> torch.Tensor:
         )
         values.extend(_one_hot(team["designated_possession_player"] + 1, 12))
 
-    values.extend(goal / 5.0 for goal in observation["goals"])
     values.extend(_one_hot(observation["game_mode"], 7))
     values.extend(_one_hot(observation["set_piece_team"] + 1, 3))
     values.extend(_one_hot(observation["set_piece_taker"] + 1, 12))

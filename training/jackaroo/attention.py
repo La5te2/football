@@ -1,8 +1,8 @@
-"""Tensor conversion and entity Transformer for the Jackaroo policy."""
+"""Public-observation tensor conversion and entity-relation encoding."""
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple, Sequence, TypeVar
+from typing import Any, NamedTuple, Sequence
 
 import torch
 from torch import nn
@@ -15,12 +15,11 @@ BASE_PLAYER_FEATURES = 24
 RELATIVE_PLAYER_FEATURES = 6
 PLAYER_FEATURES = BASE_PLAYER_FEATURES + RELATIVE_PLAYER_FEATURES
 PLAYER_ACTIVE_INDEX = BASE_PLAYER_FEATURES - 2
-CONTEXT_FEATURES = 64
+CONTEXT_FEATURES = 62
 BALL_FEATURES = 9
 MATCH_FEATURES = CONTEXT_FEATURES - BALL_FEATURES
 ENTITY_WIDTH = 128
 ENTITY_COUNT = 24
-HistoryItem = TypeVar("HistoryItem")
 
 
 class TensorFrame(NamedTuple):
@@ -83,13 +82,12 @@ def _one_hot(index: int, size: int) -> list[float]:
 
 
 def context_features(observation: Observation) -> list[float]:
-    """Encode ball, score, possession, and match mode context."""
+    """Encode the observable ball, possession, and match-mode context."""
 
     values: list[float] = []
     values.extend(observation["ball_position"])
     values.extend(observation["ball_velocity"])
     values.extend(observation["ball_rotation"])
-    values.extend(goal / 5.0 for goal in observation["goals"])
     values.extend(_one_hot(observation["game_mode"], 7))
     values.extend(_one_hot(observation["set_piece_team"] + 1, 3))
     values.extend(_one_hot(observation["set_piece_taker"] + 1, 12))
@@ -99,19 +97,6 @@ def context_features(observation: Observation) -> list[float]:
     values.extend(_one_hot(observation["last_touch_player"] + 1, 12))
     values.append(float(observation["is_in_play"]))
     return values
-
-
-def padded_history(
-    observations: Sequence[HistoryItem], length: int
-) -> list[HistoryItem]:
-    """Return one fixed causal history, padding with its first observation."""
-
-    if not observations:
-        raise ValueError("observation history must contain at least one state")
-    if length <= 0:
-        raise ValueError("history length must be positive")
-    window = list(observations[-length:])
-    return [window[0]] * (length - len(window)) + window
 
 
 def tensorize(observation: Observation) -> TensorFrame:
@@ -160,9 +145,8 @@ def tensorize(observation: Observation) -> TensorFrame:
     )
 
 
-def batch_tensor_histories(
-    histories: Sequence[Sequence[TensorFrame]],
-    history_length: int,
+def batch_tensor_frames(
+    frames: Sequence[TensorFrame],
     device: torch.device,
 ) -> tuple[
     torch.Tensor,
@@ -172,17 +156,28 @@ def batch_tensor_histories(
     torch.Tensor,
     torch.Tensor,
 ]:
-    """Stack cached tensor frames into one device batch."""
+    """Stack frames into one device batch without rebuilding their features."""
 
-    windows = [padded_history(history, history_length) for history in histories]
-    batches = []
+    if not frames:
+        raise ValueError("at least one tensor frame is required")
+    batches: list[torch.Tensor] = []
     for field in range(len(TensorFrame._fields)):
         batches.append(
-            torch.stack(
-                [torch.stack([frame[field] for frame in window]) for window in windows]
-            ).to(device, non_blocking=True)
+            torch.stack([frame[field] for frame in frames]).to(
+                device, non_blocking=True
+            )
         )
     return tuple(batches)
+
+
+def stack_tensor_frames(frames: Sequence[TensorFrame]) -> TensorFrame:
+    """Stack frames on their current device while preserving named fields."""
+
+    if not frames:
+        raise ValueError("at least one tensor frame is required")
+    return TensorFrame(
+        *(torch.stack([frame[field] for frame in frames]) for field in range(6))
+    )
 
 
 class EntityTransformerBlock(nn.Module):
@@ -272,7 +267,7 @@ class EntityTransformer(nn.Module):
         context: torch.Tensor,
         anchor_indices: torch.Tensor,
         opponent_anchor_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         shape = own.shape[:-2]
         own_flat = own.reshape(-1, 11, PLAYER_FEATURES)
         opponent_flat = opponent.reshape(-1, 11, PLAYER_FEATURES)
@@ -325,8 +320,11 @@ class EntityTransformer(nn.Module):
         opponent_team = self._masked_mean(
             tokens[:, 11:22], active_players[:, 11:22]
         )
-        output = torch.cat(
+        summary = torch.cat(
             (controlled, own_team, opponent_team, tokens[:, 22], tokens[:, 23]),
             dim=-1,
         )
-        return output.reshape(*shape, self.output_width)
+        return (
+            tokens.reshape(*shape, ENTITY_COUNT, ENTITY_WIDTH),
+            summary.reshape(*shape, self.output_width),
+        )

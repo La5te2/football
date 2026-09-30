@@ -97,7 +97,11 @@ class VectorFootballEnv:
     action_count = native.ENGINE_ACTION_COUNT
 
     def __init__(
-        self, count: int, maximum_steps: int = 3000, seed: int | None = None
+        self,
+        count: int,
+        maximum_steps: int = 3000,
+        seed: int | None = None,
+        fixed_seed: int | None = None,
     ) -> None:
         if count <= 0:
             raise ValueError("environment count must be positive")
@@ -105,6 +109,9 @@ class VectorFootballEnv:
         self.count = count
         self.maximum_steps = maximum_steps
         self._seed_generator = random.Random(seed)
+        self._fixed_seed = (
+            None if fixed_seed is None else int(fixed_seed) & 0xFFFFFFFF
+        )
         self._used_seeds: set[int] = set()
         self._next_left_team = [index % 2 == 0 for index in range(count)]
         self._native = native.create_batch(str(data), str(font), maximum_steps, count)
@@ -112,6 +119,8 @@ class VectorFootballEnv:
         self._segment_action_counts = [0] * count
 
     def _seed(self) -> int:
+        if self._fixed_seed is not None:
+            return self._fixed_seed
         while True:
             seed = self._seed_generator.getrandbits(32)
             if seed not in self._used_seeds:
@@ -131,24 +140,6 @@ class VectorFootballEnv:
             self._segment_action_counts[index] = 0
         return self._observations
 
-    def reset_builtin(
-        self, seeds: Sequence[int], sides: Sequence[bool]
-    ) -> list[Observation]:
-        """Reset pure built-in matches with explicit reproducible seeds."""
-
-        if len(seeds) != self.count or len(sides) != self.count:
-            raise ValueError("one seed and side are required per environment")
-        self._observations = list(
-            native.reset_builtin_batch(
-                self._native,
-                [int(seed) & 0xFFFFFFFF for seed in seeds],
-                list(sides),
-            )
-        )
-        for index, observation in enumerate(self._observations):
-            self._segment_action_counts[index] = 0
-        return self._observations
-
     def reset_one(self, index: int) -> Observation:
         if not 0 <= index < self.count:
             raise IndexError("environment index is out of range")
@@ -158,14 +149,6 @@ class VectorFootballEnv:
         self._observations[index] = observation
         self._segment_action_counts[index] = 0
         return observation
-
-    def step_builtin(self) -> tuple[list[Observation], list[bool]]:
-        """Advance pure built-in matches through the threaded native batch."""
-
-        decisions = [[native.ENGINE_ACTION_COUNT] * 11 for _ in range(self.count)]
-        results = native.step_batch(self._native, decisions)
-        self._observations = [result[0] for result in results]
-        return self._observations, [bool(result[1]) for result in results]
 
     def step(
         self, actions: Sequence[int], active: Sequence[bool] | None = None

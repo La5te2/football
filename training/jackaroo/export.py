@@ -7,8 +7,14 @@ from pathlib import Path
 
 import torch
 
-from .attention import CONTEXT_FEATURES, PLAYER_FEATURES
-from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
+from .attention import CONTEXT_FEATURES, ENTITY_COUNT, PLAYER_FEATURES
+from .network import (
+    ENTITY_STATE_WIDTH,
+    GLOBAL_STATE_WIDTH,
+    ActorCritic,
+    POLICY_ARCHITECTURE,
+    POLICY_OBJECTIVE,
+)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -44,16 +50,15 @@ def main() -> None:
     policy.load_state_dict(checkpoint["model"], strict=True)
     policy.eval()
 
-    history_length = int(checkpoint.get("history_length", 1))
-    if history_length <= 0:
-        raise ValueError("checkpoint history length must be positive")
     example = (
-        torch.zeros(1, history_length, int(checkpoint["frame_size"])),
-        torch.zeros(1, history_length, 11, PLAYER_FEATURES),
-        torch.zeros(1, history_length, 11, PLAYER_FEATURES),
-        torch.zeros(1, history_length, CONTEXT_FEATURES),
-        torch.zeros(1, history_length, dtype=torch.long),
-        torch.zeros(1, history_length, dtype=torch.long),
+        torch.zeros(1, int(checkpoint["frame_size"])),
+        torch.zeros(1, 11, PLAYER_FEATURES),
+        torch.zeros(1, 11, PLAYER_FEATURES),
+        torch.zeros(1, CONTEXT_FEATURES),
+        torch.zeros(1, dtype=torch.long),
+        torch.zeros(1, dtype=torch.long),
+        torch.zeros(1, ENTITY_COUNT, ENTITY_STATE_WIDTH),
+        torch.zeros(1, GLOBAL_STATE_WIDTH),
     )
     with torch.inference_mode():
         exported = torch.jit.trace(policy, example, strict=True)

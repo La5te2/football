@@ -49,10 +49,9 @@ mkdir -p "$RUN_DIR"
 nohup env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -u \
   -m training.jackaroo.train \
   --device auto \
-  --imitation-games 256 \
-  --imitation-epochs 2 \
   --updates 3000 \
   --steps-per-update 8192 \
+  --sequence-length 32 \
   --ppo-epochs 4 \
   --ppo-batch-size 256 \
   --learning-rate 0.0001 \

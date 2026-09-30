@@ -77,21 +77,6 @@ class TrainingEnvironmentBatch {
     return observations_;
   }
 
-  std::vector<TrainingObservation> ResetBuiltin(
-      const std::vector<std::uint32_t>& seeds,
-      const std::vector<bool>& left_teams) {
-    if (seeds.size() != environments_.size() ||
-        left_teams.size() != environments_.size()) {
-      throw std::invalid_argument(
-          "batch reset requires one seed and side per environment");
-    }
-    for (std::size_t index = 0; index < environments_.size(); ++index) {
-      observations_[index] = environments_[index]->ResetBuiltin(
-          seeds[index], left_teams[index]);
-    }
-    return observations_;
-  }
-
   TrainingObservation ResetOne(int index, std::uint32_t seed,
                                bool left_team) {
     if (index < 0 || index >= size()) {
@@ -489,21 +474,6 @@ PyObject* Reset(PyObject*, PyObject* arguments) {
   });
 }
 
-PyObject* ResetBuiltin(PyObject*, PyObject* arguments) {
-  PyObject* capsule = nullptr;
-  unsigned long seed = 0;
-  int left_team = 1;
-  if (!PyArg_ParseTuple(arguments, "Ok|p", &capsule, &seed, &left_team)) {
-    return nullptr;
-  }
-  TrainingEnvironment* environment = GetEnvironment(capsule);
-  if (!environment) return nullptr;
-  return TranslateExceptions([&]() {
-    return ObservationToPython(environment->ResetBuiltin(
-        static_cast<std::uint32_t>(seed), left_team != 0));
-  });
-}
-
 PyObject* Step(PyObject*, PyObject* arguments) {
   PyObject* capsule = nullptr;
   PyObject* decision_object = nullptr;
@@ -599,70 +569,6 @@ PyObject* ResetBatch(PyObject*, PyObject* arguments) {
   return TranslateExceptions([&]() -> PyObject* {
     const std::vector<TrainingObservation> observations = RunWithoutGil(
         [&]() { return environment->Reset(seed_values, side_values); });
-    PyObject* result = PyList_New(count);
-    if (!result) return nullptr;
-    for (int index = 0; index < count; ++index) {
-      PyObject* observation = ObservationToPython(observations[index]);
-      if (!observation) {
-        Py_DECREF(result);
-        return nullptr;
-      }
-      PyList_SET_ITEM(result, index, observation);
-    }
-    return result;
-  });
-}
-
-PyObject* ResetBuiltinBatch(PyObject*, PyObject* arguments) {
-  PyObject* capsule = nullptr;
-  PyObject* seed_object = nullptr;
-  PyObject* side_object = nullptr;
-  if (!PyArg_ParseTuple(arguments, "OOO", &capsule, &seed_object,
-                        &side_object)) {
-    return nullptr;
-  }
-  TrainingEnvironmentBatch* environment = GetBatchEnvironment(capsule);
-  if (!environment) return nullptr;
-  PyObject* seeds = PySequence_Fast(
-      seed_object, "seeds must be a sequence with one value per environment");
-  PyObject* sides = PySequence_Fast(
-      side_object, "sides must be a sequence with one value per environment");
-  if (!seeds || !sides) {
-    Py_XDECREF(seeds);
-    Py_XDECREF(sides);
-    return nullptr;
-  }
-  const int count = environment->size();
-  if (PySequence_Fast_GET_SIZE(seeds) != count ||
-      PySequence_Fast_GET_SIZE(sides) != count) {
-    Py_DECREF(seeds);
-    Py_DECREF(sides);
-    PyErr_SetString(PyExc_ValueError,
-                    "batch reset requires one seed and side per environment");
-    return nullptr;
-  }
-  std::vector<std::uint32_t> seed_values(count);
-  std::vector<bool> side_values(count);
-  for (int index = 0; index < count; ++index) {
-    const unsigned long long seed = PyLong_AsUnsignedLongLong(
-        PySequence_Fast_GET_ITEM(seeds, index));
-    const int side = PyObject_IsTrue(PySequence_Fast_GET_ITEM(sides, index));
-    if (PyErr_Occurred() || seed > UINT32_MAX || side < 0) {
-      Py_DECREF(seeds);
-      Py_DECREF(sides);
-      if (!PyErr_Occurred()) {
-        PyErr_SetString(PyExc_ValueError, "seed must fit in 32 bits");
-      }
-      return nullptr;
-    }
-    seed_values[index] = static_cast<std::uint32_t>(seed);
-    side_values[index] = side != 0;
-  }
-  Py_DECREF(seeds);
-  Py_DECREF(sides);
-  return TranslateExceptions([&]() -> PyObject* {
-    const std::vector<TrainingObservation> observations = RunWithoutGil(
-        [&]() { return environment->ResetBuiltin(seed_values, side_values); });
     PyObject* result = PyList_New(count);
     if (!result) return nullptr;
     for (int index = 0; index < count; ++index) {
@@ -802,16 +708,12 @@ PyMethodDef methods[] = {
     {"create", reinterpret_cast<PyCFunction>(Create),
      METH_VARARGS | METH_KEYWORDS, "Create one native training environment."},
     {"reset", Reset, METH_VARARGS, "Reset a match with the requested seed."},
-    {"reset_builtin", ResetBuiltin, METH_VARARGS,
-     "Reset a pure built-in-AI match for demonstration collection."},
     {"step", Step, METH_VARARGS,
      "Submit one player/action decision and advance the match."},
     {"create_batch", reinterpret_cast<PyCFunction>(CreateBatch),
      METH_VARARGS | METH_KEYWORDS, "Create native training environments."},
     {"reset_batch", ResetBatch, METH_VARARGS,
      "Reset every native training environment."},
-    {"reset_builtin_batch", ResetBuiltinBatch, METH_VARARGS,
-     "Reset native environments without external controllers."},
     {"reset_batch_one", ResetBatchOne, METH_VARARGS,
      "Reset one native training environment."},
     {"step_batch", StepBatch, METH_VARARGS,

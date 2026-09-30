@@ -9,14 +9,13 @@ from typing import Callable
 import torch
 
 from .env import FootballEnv
-from .attention import batch_tensor_histories, tensorize
+from .attention import batch_tensor_frames, tensorize
 from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
 
 
 def evaluate_policy(
     policy: ActorCritic,
     maximum_steps: int,
-    history_length: int,
     games: int,
     seed: int,
     progress: Callable[[str], None] | None = None,
@@ -44,21 +43,20 @@ def evaluate_policy(
     policy.eval()
     for game in range(games):
         observation = environment.reset((seed + game // 2) & 0xFFFFFFFF)
-        history = []
+        state = policy.initial_state(1, device)
         match_done = False
         info = {"goals": (0, 0)}
         next_progress_step = 500
         while not match_done:
             action = 0
             if observation["is_in_play"]:
-                history.append(tensorize(observation))
-                if len(history) > history_length:
-                    del history[:-history_length]
                 with torch.inference_mode():
-                    logits, _ = policy(
-                        *batch_tensor_histories([history], history_length, device)
+                    _, output = policy.distributions(
+                        *batch_tensor_frames([tensorize(observation)], device),
+                        state,
                     )
-                action = logits[0].argmax().item()
+                    state = output.state
+                action = output.logits[0].argmax().item()
             observation, _, segment_done, info = environment.step(action)
             if segment_done:
                 result = info["segment_result"]
@@ -66,7 +64,7 @@ def evaluate_policy(
                 segment_draws += result == 0
                 segment_losses += result == -1
                 segment_steps += info["segment_steps"]
-                history.clear()
+                state = policy.initial_state(1, device)
             match_done = info["match_done"]
             if progress is not None and observation["step"] >= next_progress_step:
                 goals = tuple(info["goals"])
@@ -130,11 +128,9 @@ def main() -> None:
         device
     )
     policy.load_state_dict(checkpoint["model"])
-    history_length = checkpoint.get("history_length", 1)
     metrics = evaluate_policy(
         policy,
         checkpoint["maximum_steps"],
-        history_length,
         arguments.games,
         arguments.seed,
         progress=print,
