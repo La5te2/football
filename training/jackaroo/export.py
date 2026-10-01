@@ -61,7 +61,11 @@ def main() -> None:
         torch.zeros(1, GLOBAL_STATE_WIDTH),
     )
     with torch.inference_mode():
-        exported = torch.jit.trace(policy, example, strict=True)
+        # MultiheadAttention may choose a different eager kernel after warm-up.
+        # The explicit tensor comparison below validates the resulting trace.
+        exported = torch.jit.trace(
+            policy, example, strict=True, check_trace=False
+        )
         expected = policy(*example)
         actual = exported(*example)
     for expected_tensor, actual_tensor in zip(expected, actual):

@@ -20,8 +20,7 @@ def _one_hot(index: int, size: int) -> list[float]:
 def encode(observation: Observation) -> torch.Tensor:
     """Encode the public football state used by the Jackaroo policy.
 
-    Absolute match time and the engine step remain environment controls. No
-    training-only player selection or hidden engine state is added here.
+    Every feature is derived from the public model observation.
     """
 
     values: list[float] = []

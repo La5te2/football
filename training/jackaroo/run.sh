@@ -44,6 +44,8 @@ nohup env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -u \
   -m training.jackaroo.train \
   --device auto \
   --updates 3000 \
+  --pretraining-games 256 \
+  --pretraining-epochs 2 \
   --games-per-update 256 \
   --sequence-length 32 \
   --ppo-epochs 4 \

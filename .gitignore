@@ -21,10 +21,6 @@ matches/
 /bin/
 *.gfr
 
-# Local model weights are preserved but distributed separately.
-/models/**/*.pth
-/models/**/*.pt
-
 # CMake and vcpkg
 CMakeCache.txt
 CMakeFiles/

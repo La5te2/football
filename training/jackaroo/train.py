@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import torch
@@ -13,7 +14,9 @@ from .env import FootballEnv, SelfPlayVectorFootballEnv
 from .evaluate import evaluate_policy
 from .features import encode
 from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
+from .pretrain import collect_tamakeri_rollout, pretrain
 from .ppo import collect_self_play_rollout, update
+from .tamakeri import TAMAKERI_WEIGHTS, TamakEriTeacher
 
 
 def _status(message: str) -> None:
@@ -23,6 +26,9 @@ def _status(message: str) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--updates", type=int, default=1000)
+    parser.add_argument("--pretraining-games", type=int, default=256)
+    parser.add_argument("--pretraining-epochs", type=int, default=2)
+    parser.add_argument("--pretraining-batch-size", type=int, default=256)
     parser.add_argument("--games-per-update", type=int, default=256)
     parser.add_argument("--flight", type=int, default=16)
     parser.add_argument("--maximum-steps", type=int, default=3000)
@@ -61,12 +67,21 @@ def _append_log(path: Path, record: dict[str, Any]) -> None:
 
 def _validate_arguments(arguments: argparse.Namespace) -> None:
     positive = (
-        "updates", "games_per_update", "flight", "maximum_steps",
+        "updates", "flight", "maximum_steps",
         "sequence_length", "ppo_epochs", "ppo_batch_size",
     )
     for name in positive:
         if getattr(arguments, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
+    nonnegative_integers = ("games_per_update", "pretraining_games")
+    for name in nonnegative_integers:
+        if getattr(arguments, name) < 0:
+            raise ValueError(f"{name.replace('_', '-')} must be nonnegative")
+    if arguments.games_per_update == 0 and arguments.updates > 0:
+        raise ValueError("games-per-update must be positive when updates are requested")
+    if arguments.pretraining_games:
+        if arguments.pretraining_epochs <= 0 or arguments.pretraining_batch_size <= 0:
+            raise ValueError("pretraining epochs and batch size must be positive")
     if arguments.learning_rate <= 0.0:
         raise ValueError("learning-rate must be positive")
     nonnegative = (
@@ -145,12 +160,107 @@ def main() -> None:
     _status(
         f"self-play flight={arguments.flight} seed_sequence={arguments.seed} ready"
     )
+    pretraining_metrics = checkpoint.get("pretraining", {})
+    if arguments.resume is None and arguments.pretraining_games:
+        _status(
+            f"pretraining collection start games={arguments.pretraining_games} "
+            f"teacher=tamakeri"
+        )
+        teacher = TamakEriTeacher(
+            2 * arguments.flight,
+            arguments.maximum_steps,
+            device,
+            TAMAKERI_WEIGHTS,
+        )
+        teacher_rollout, teacher_segments, teacher_matches = (
+            collect_tamakeri_rollout(
+                environment,
+                teacher,
+                policy,
+                arguments.pretraining_games,
+                arguments.sequence_length,
+                progress=lambda message: _status(
+                    f"pretraining collection {message}"
+                ),
+            )
+        )
+        sampled_matches += len(teacher_matches)
+        _status(
+            f"pretraining optimize start transitions={teacher_rollout.transition_count} "
+            f"segments={len(teacher_segments)} "
+            f"scored={sum(result != 0 for result, _ in teacher_segments)}"
+        )
+        losses = pretrain(
+            policy,
+            optimizer,
+            teacher_rollout,
+            epochs=arguments.pretraining_epochs,
+            batch_size=arguments.pretraining_batch_size,
+            transition_coefficient=arguments.transition_coefficient,
+            action_value_coefficient=arguments.action_value_coefficient,
+            control_coefficient=arguments.control_coefficient,
+            progress=lambda message: _status(f"pretraining optimize {message}"),
+        )
+        pretraining_metrics = {
+            "teacher": "tamakeri",
+            "games": len(teacher_matches),
+            "segments": len(teacher_segments),
+            "scored_segments": sum(
+                result != 0 for result, _ in teacher_segments
+            ),
+            "censored_segments": sum(
+                result == 0 for result, _ in teacher_segments
+            ),
+            "transitions": teacher_rollout.transition_count,
+            "losses": losses,
+        }
+        _status(
+            f"pretraining complete games={len(teacher_matches)} "
+            f"segments={pretraining_metrics['segments']} "
+            f"scored={pretraining_metrics['scored_segments']} "
+            f"accuracy={losses['accuracy']:.4f}"
+        )
+        del teacher_rollout, teacher
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        bootstrap_checkpoint = {
+            "architecture": POLICY_ARCHITECTURE,
+            "parameter_count": parameter_count,
+            "model": policy.state_dict(),
+            "frame_size": frame_size,
+            "action_count": action_count,
+            "maximum_steps": arguments.maximum_steps,
+            "sequence_length": arguments.sequence_length,
+            "flight": arguments.flight,
+            "games_per_update": arguments.games_per_update,
+            "sampled_matches": sampled_matches,
+            "seed": arguments.seed,
+            "ppo_epochs": arguments.ppo_epochs,
+            "ppo_batch_size": arguments.ppo_batch_size,
+            "entropy_coefficient": arguments.entropy_coefficient,
+            "transition_coefficient": arguments.transition_coefficient,
+            "action_value_coefficient": arguments.action_value_coefficient,
+            "control_coefficient": arguments.control_coefficient,
+            "objective": POLICY_OBJECTIVE,
+            "feature_scaling": "fixed",
+            "updates": 0,
+            "pretraining": pretraining_metrics,
+            "diagnostics": {},
+            "evaluation": {},
+            "optimizer": optimizer.state_dict(),
+        }
+        _status("pretraining checkpoint saving")
+        _atomic_torch_save(bootstrap_checkpoint, arguments.checkpoint)
+        _status(f"pretraining checkpoint saved={arguments.checkpoint}")
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         _status(
             f"update={iteration} rollout start "
             f"target_games={arguments.games_per_update}"
         )
+        rollout_started = time.perf_counter()
         rollout, segments, matches = collect_self_play_rollout(
             environment,
             policy,
@@ -158,8 +268,10 @@ def main() -> None:
             sequence_length=arguments.sequence_length,
             progress=lambda message: _status(f"update={iteration} rollout {message}"),
         )
+        rollout_seconds = time.perf_counter() - rollout_started
         sampled_matches += len(matches)
         _status(f"update={iteration} ppo start")
+        ppo_started = time.perf_counter()
         losses = update(
             policy,
             optimizer,
@@ -172,6 +284,7 @@ def main() -> None:
             control_coefficient=arguments.control_coefficient,
             progress=lambda message: _status(f"update={iteration} ppo {message}"),
         )
+        ppo_seconds = time.perf_counter() - ppo_started
         action_counts = torch.bincount(
             rollout.actions[rollout.valid].detach().cpu(), minlength=action_count
         ).float()
@@ -182,6 +295,7 @@ def main() -> None:
         mean_segment_steps = sum(length for _, length in retained_segments) / max(
             len(retained_segments), 1
         )
+        engine_steps = sum(length for _, length in segments)
         diagnostics = {
             "action_distribution": (action_counts / action_counts.sum()).tolist(),
             "transition_count": rollout.transition_count,
@@ -192,6 +306,16 @@ def main() -> None:
             ),
             "censored_segments": censored_segments,
             "mean_segment_steps": mean_segment_steps,
+            "rollout_seconds": rollout_seconds,
+            "engine_steps_per_second": engine_steps / max(rollout_seconds, 1e-9),
+            "ppo_seconds": ppo_seconds,
+            "ppo_transitions_per_second": (
+                rollout.transition_count / max(ppo_seconds, 1e-9)
+            ),
+            "peak_gpu_memory_bytes": (
+                torch.cuda.max_memory_allocated(device)
+                if device.type == "cuda" else 0
+            ),
         }
         _status(f"update={iteration} validation seed={arguments.validation_seed} start")
         evaluation = evaluate_policy(
@@ -220,6 +344,9 @@ def main() -> None:
             f"transition={losses['outcome'] + losses['terminal'] + losses['latent']:.4f} "
             f"q={losses['action_value']:.4f} control={losses['control']:.4f} "
             f"kl={losses['kl']:.5f} clipped={losses['clip_fraction']:.4f} "
+            f"engine_steps_s={diagnostics['engine_steps_per_second']:.1f} "
+            f"ppo_transitions_s={diagnostics['ppo_transitions_per_second']:.1f} "
+            f"gpu_peak_mib={diagnostics['peak_gpu_memory_bytes'] / 1048576.0:.1f} "
             f"validation={validation_scores}",
             flush=True,
         )
@@ -244,6 +371,7 @@ def main() -> None:
             "objective": POLICY_OBJECTIVE,
             "feature_scaling": "fixed",
             "updates": iteration,
+            "pretraining": pretraining_metrics,
             "diagnostics": diagnostics,
             "evaluation": evaluation,
             "optimizer": optimizer.state_dict(),

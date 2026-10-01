@@ -16,7 +16,7 @@ from .network import ActorCritic, RecurrentState
 
 
 @dataclass
-class _Transition:
+class Transition:
     frame: TensorFrame
     next_frame: TensorFrame
     state: RecurrentState | None
@@ -24,11 +24,12 @@ class _Transition:
     old_log_probability: float
     old_value: float
     terminal_class: int = 0
+    action_supervised: bool = True
 
 
 @dataclass
-class _Segment:
-    transitions: list[_Transition]
+class Segment:
+    transitions: list[Transition]
     result: int
 
 
@@ -42,12 +43,10 @@ class Rollout:
     context: torch.Tensor
     anchor_indices: torch.Tensor
     opponent_anchor_indices: torch.Tensor
-    next_encoded: torch.Tensor
     next_own: torch.Tensor
     next_opponent: torch.Tensor
     next_context: torch.Tensor
     next_anchor_indices: torch.Tensor
-    next_opponent_anchor_indices: torch.Tensor
     initial_entity_state: torch.Tensor
     initial_global_state: torch.Tensor
     valid: torch.Tensor
@@ -56,6 +55,7 @@ class Rollout:
     advantages: torch.Tensor
     returns: torch.Tensor
     terminal_classes: torch.Tensor
+    action_supervision: torch.Tensor
     reward_total: float
     transition_count: int
 
@@ -88,10 +88,9 @@ def _clear_state(state: RecurrentState, index: int) -> RecurrentState:
 
 
 def _stack_padded_frames(
-    chunks: list[list[_Transition]],
+    chunks: list[list[Transition]],
     length: int,
     next_frame: bool,
-    device: torch.device,
 ) -> tuple[torch.Tensor, ...]:
     fields: list[torch.Tensor] = []
     for field in range(len(TensorFrame._fields)):
@@ -106,24 +105,46 @@ def _stack_padded_frames(
             if padding[0]:
                 value = torch.cat((value, torch.zeros(padding, dtype=value.dtype)))
             sequences.append(value)
-        fields.append(torch.stack(sequences).to(device, non_blocking=True))
+        stacked = torch.stack(sequences)
+        if stacked.is_floating_point():
+            stacked = stacked.to(torch.float16)
+        fields.append(stacked)
     return tuple(fields)
 
 
-def _pack_rollout(
-    segments: list[_Segment], sequence_length: int, device: torch.device
-) -> Rollout:
-    chunks: list[list[_Transition]] = []
+def compact_frame(frame: TensorFrame) -> TensorFrame:
+    """Store a rollout frame on the CPU without retaining full-precision buffers."""
+
+    return TensorFrame(*(
+        value.to(dtype=torch.float16, device="cpu")
+        if value.is_floating_point() else value.to(device="cpu")
+        for value in frame
+    ))
+
+
+def _batch_tensor(
+    tensor: torch.Tensor, indices: torch.Tensor, device: torch.device
+) -> torch.Tensor:
+    """Load one CPU rollout slice onto the policy device."""
+
+    value = tensor.index_select(0, indices)
+    if value.dtype == torch.float16:
+        value = value.float()
+    return value.to(device, non_blocking=True)
+
+
+def pack_rollout(segments: list[Segment], sequence_length: int) -> Rollout:
+    chunks: list[list[Transition]] = []
     chunk_results: list[int] = []
     for segment in segments:
         for start in range(0, len(segment.transitions), sequence_length):
             chunks.append(segment.transitions[start:start + sequence_length])
             chunk_results.append(segment.result)
     if not chunks:
-        raise RuntimeError("rollout contains no scored segment")
+        raise RuntimeError("rollout contains no retained segment")
 
-    current = _stack_padded_frames(chunks, sequence_length, False, device)
-    following = _stack_padded_frames(chunks, sequence_length, True, device)
+    current = _stack_padded_frames(chunks, sequence_length, False)
+    following = _stack_padded_frames(chunks, sequence_length, True)
     sequence_count = len(chunks)
     valid = torch.zeros(sequence_count, sequence_length, dtype=torch.bool)
     actions = torch.zeros(sequence_count, sequence_length, dtype=torch.long)
@@ -131,6 +152,7 @@ def _pack_rollout(
     old_values = torch.zeros(sequence_count, sequence_length)
     returns = torch.zeros(sequence_count, sequence_length)
     terminal_classes = torch.zeros(sequence_count, sequence_length, dtype=torch.long)
+    action_supervision = torch.zeros(sequence_count, sequence_length, dtype=torch.bool)
     initial_entities = []
     initial_globals = []
     transition_count = 0
@@ -147,25 +169,29 @@ def _pack_rollout(
         terminal_classes[index, :count] = torch.tensor(
             [item.terminal_class for item in chunk]
         )
+        action_supervision[index, :count] = torch.tensor(
+            [item.action_supervised for item in chunk]
+        )
         if chunk[0].state is None:
             raise RuntimeError("sequence start is missing its recurrent state")
         initial_entities.append(chunk[0].state.entities)
         initial_globals.append(chunk[0].state.global_state)
 
-    valid = valid.to(device)
-    returns = returns.to(device)
-    old_values = old_values.to(device)
     return Rollout(
         *current,
-        *following,
-        torch.cat(initial_entities).to(device, non_blocking=True),
-        torch.cat(initial_globals).to(device, non_blocking=True),
+        following[1],
+        following[2],
+        following[3],
+        following[4],
+        torch.cat(initial_entities).to(torch.float16),
+        torch.cat(initial_globals).to(torch.float16),
         valid,
-        actions.to(device),
-        old_log_probabilities.to(device),
+        actions,
+        old_log_probabilities,
         returns - old_values,
         returns,
-        terminal_classes.to(device),
+        terminal_classes,
+        action_supervision,
         float(sum(segment.result for segment in segments)),
         transition_count,
     )
@@ -191,8 +217,8 @@ def collect_self_play_rollout(
     device = next(policy.parameters()).device
     agent_count = 2 * environment.count
     recurrent = policy.initial_state(agent_count, device)
-    pending: list[list[_Transition]] = [[] for _ in range(agent_count)]
-    retained: list[_Segment] = []
+    pending: list[list[Transition]] = [[] for _ in range(agent_count)]
+    retained: list[Segment] = []
     completed_segments: list[tuple[int, int]] = []
     completed_matches: list[tuple[int, int]] = []
     simulated_steps = flight = 0
@@ -241,8 +267,8 @@ def collect_self_play_rollout(
                     sequence_start = len(pending[agent_index]) % sequence_length == 0
                     saved_state = (
                         RecurrentState(
-                            before.entities[local:local + 1].cpu(),
-                            before.global_state[local:local + 1].cpu(),
+                            before.entities[local:local + 1].detach().cpu().half(),
+                            before.global_state[local:local + 1].detach().cpu().half(),
                         )
                         if sequence_start else None
                     )
@@ -268,9 +294,11 @@ def collect_self_play_rollout(
                             agent_index
                         ]
                         pending[agent_index].append(
-                            _Transition(
-                                frame,
-                                tensorize(next_observations[environment_index][side]),
+                            Transition(
+                                compact_frame(frame),
+                                compact_frame(tensorize(
+                                    next_observations[environment_index][side]
+                                )),
                                 before,
                                 action,
                                 log_probability,
@@ -294,14 +322,14 @@ def collect_self_play_rollout(
                                 raise RuntimeError(
                                     "a scored self-play segment has no policy decision"
                                 )
-                            pending[agent_index][-1].next_frame = tensorize(
-                                next_observations[environment_index][side]
+                            pending[agent_index][-1].next_frame = compact_frame(
+                                tensorize(next_observations[environment_index][side])
                             )
                             pending[agent_index][-1].terminal_class = (
                                 1 if side_result == 1 else 2
                             )
                             retained.append(
-                                _Segment(pending[agent_index], int(side_result))
+                                Segment(pending[agent_index], int(side_result))
                             )
                     for side in range(2):
                         agent_index = 2 * environment_index + side
@@ -328,7 +356,7 @@ def collect_self_play_rollout(
             )
 
     return (
-        _pack_rollout(retained, sequence_length, device),
+        pack_rollout(retained, sequence_length),
         completed_segments,
         completed_matches,
     )
@@ -365,43 +393,65 @@ def update(
     )
     totals = {name: 0.0 for name in names}
     total_samples = 0
+    device = next(policy.parameters()).device
     policy.train()
 
     for epoch in range(1, epochs + 1):
         epoch_totals = {name: 0.0 for name in names}
         epoch_samples = 0
-        batches = torch.randperm(
-            sequence_count, device=rollout.encoded.device
-        ).split(sequences_per_batch)
+        batches = torch.randperm(sequence_count).split(sequences_per_batch)
         for batch_number, indices in enumerate(batches, start=1):
-            valid = rollout.valid[indices]
+            encoded = _batch_tensor(rollout.encoded, indices, device)
+            own = _batch_tensor(rollout.own, indices, device)
+            opponent = _batch_tensor(rollout.opponent, indices, device)
+            context = _batch_tensor(rollout.context, indices, device)
+            anchor_indices = _batch_tensor(rollout.anchor_indices, indices, device)
+            opponent_anchor_indices = _batch_tensor(
+                rollout.opponent_anchor_indices, indices, device
+            )
+            initial_entity_state = _batch_tensor(
+                rollout.initial_entity_state, indices, device
+            )
+            initial_global_state = _batch_tensor(
+                rollout.initial_global_state, indices, device
+            )
+            valid = _batch_tensor(rollout.valid, indices, device)
+            actions = _batch_tensor(rollout.actions, indices, device)
+            old_log_probability = _batch_tensor(
+                rollout.old_log_probabilities, indices, device
+            )
+            advantages = _batch_tensor(normalized_advantages, indices, device)
+            returns = _batch_tensor(rollout.returns, indices, device)
+            terminal_classes = _batch_tensor(
+                rollout.terminal_classes, indices, device
+            )
+            next_own = _batch_tensor(rollout.next_own, indices, device)
+            next_opponent = _batch_tensor(rollout.next_opponent, indices, device)
+            next_context = _batch_tensor(rollout.next_context, indices, device)
+            next_anchor_indices = _batch_tensor(
+                rollout.next_anchor_indices, indices, device
+            )
             output = policy.sequence(
-                rollout.encoded[indices], rollout.own[indices],
-                rollout.opponent[indices], rollout.context[indices],
-                rollout.anchor_indices[indices], rollout.opponent_anchor_indices[indices],
-                RecurrentState(
-                    rollout.initial_entity_state[indices],
-                    rollout.initial_global_state[indices],
-                ),
+                encoded, own, opponent, context,
+                anchor_indices, opponent_anchor_indices,
+                RecurrentState(initial_entity_state, initial_global_state),
                 valid,
             )
             distribution = Categorical(logits=output.logits)
-            log_probability = distribution.log_prob(rollout.actions[indices])
-            old_log_probability = rollout.old_log_probabilities[indices]
+            log_probability = distribution.log_prob(actions)
             log_ratio = log_probability - old_log_probability
             ratio = log_ratio.exp()
-            advantages = normalized_advantages[indices]
             unclipped = ratio * advantages
             clipped = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
             policy_loss = -torch.minimum(unclipped, clipped)[valid].mean()
             value_loss = nn.functional.mse_loss(
-                output.value[valid], rollout.returns[indices][valid]
+                output.value[valid], returns[valid]
             )
             entropy = distribution.entropy()[valid].mean()
             approximate_kl = ((ratio - 1.0) - log_ratio)[valid].mean()
             clip_fraction = ((ratio - 1.0).abs() > clip_ratio)[valid].float().mean()
 
-            action_index = rollout.actions[indices].unsqueeze(-1)
+            action_index = actions.unsqueeze(-1)
             selected_outcome = output.predicted_outcome.gather(
                 2, action_index[..., None].expand(-1, -1, 1, output.predicted_outcome.shape[-1])
             ).squeeze(2)
@@ -413,17 +463,17 @@ def update(
             ).squeeze(2)
             selected_action_value = output.action_values.gather(2, action_index).squeeze(-1)
             target_outcome = policy.observed_outcome(
-                rollout.next_own[indices].reshape(-1, 11, rollout.next_own.shape[-1]),
-                rollout.next_opponent[indices].reshape(-1, 11, rollout.next_opponent.shape[-1]),
-                rollout.next_context[indices].reshape(-1, rollout.next_context.shape[-1]),
-                rollout.next_anchor_indices[indices].reshape(-1),
+                next_own.reshape(-1, 11, next_own.shape[-1]),
+                next_opponent.reshape(-1, 11, next_opponent.shape[-1]),
+                next_context.reshape(-1, next_context.shape[-1]),
+                next_anchor_indices.reshape(-1),
             ).reshape(*valid.shape, -1)
             outcome_loss = nn.functional.mse_loss(selected_outcome[valid], target_outcome[valid])
             terminal_loss = nn.functional.cross_entropy(
-                selected_terminal[valid], rollout.terminal_classes[indices][valid]
+                selected_terminal[valid], terminal_classes[valid]
             )
             latent_valid = valid[:, :-1] & valid[:, 1:]
-            latent_valid &= rollout.terminal_classes[indices, :-1] == 0
+            latent_valid &= terminal_classes[:, :-1] == 0
             if latent_valid.any():
                 latent_loss = nn.functional.smooth_l1_loss(
                     selected_latent[:, :-1][latent_valid],
@@ -432,10 +482,10 @@ def update(
             else:
                 latent_loss = selected_latent.sum() * 0.0
             action_value_loss = nn.functional.mse_loss(
-                selected_action_value[valid], rollout.returns[indices][valid]
+                selected_action_value[valid], returns[valid]
             )
 
-            players = torch.cat((rollout.own[indices], rollout.opponent[indices]), dim=2)
+            players = torch.cat((own, opponent), dim=2)
             reach_target = players[..., 20]
             reach_valid = valid[..., None] & (players[..., PLAYER_ACTIVE_INDEX] > 0.5)
             reach_valid &= reach_target > 0.0

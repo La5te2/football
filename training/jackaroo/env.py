@@ -313,9 +313,31 @@ class SelfPlayVectorFootballEnv:
                 team_decisions.append(decision)
             decisions.append(team_decisions)
 
+        return self.step_decisions(decisions, active_flags)
+
+    def step_decisions(
+        self,
+        decisions: Sequence[Sequence[Sequence[int]]],
+        active: Sequence[bool] | None = None,
+    ) -> tuple[
+        list[ObservationPair], list[int], list[bool], list[dict[str, Any]]
+    ]:
+        """Advance matches from complete eleven-player team decisions."""
+
+        if len(decisions) != self.count:
+            raise ValueError("one decision pair is required per environment")
+        active_flags = [True] * self.count if active is None else list(active)
+        if len(active_flags) != self.count:
+            raise ValueError("one activity flag is required per environment")
+        normalized: list[list[list[int]]] = []
+        for pair in decisions:
+            if len(pair) != 2 or any(len(team) != 11 for team in pair):
+                raise ValueError("each decision must contain two eleven-player teams")
+            normalized.append([list(pair[0]), list(pair[1])])
+
         previous_observations = self._observations
         native_results = native.step_self_play_batch(
-            self._native, decisions, active_flags
+            self._native, normalized, active_flags
         )
         observations = [tuple(result[0]) for result in native_results]
         match_done = [bool(result[1]) for result in native_results]

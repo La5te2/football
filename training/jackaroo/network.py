@@ -17,7 +17,7 @@ from .attention import (
 )
 
 
-POLICY_ARCHITECTURE = "persistent-entity-control-transformer"
+POLICY_ARCHITECTURE = "persistent-entity-control-transition-transformer"
 POLICY_OBJECTIVE = "next-goal-wdl"
 ENTITY_STATE_WIDTH = 64
 GLOBAL_STATE_WIDTH = 256
@@ -108,7 +108,7 @@ class ControlField(nn.Module):
         ys = torch.linspace(-0.42, 0.42, CONTROL_GRID_Y)
         self.register_buffer("locations", torch.cartesian_prod(xs, ys))
         self.register_buffer("maximum_speed", torch.tensor(0.012))
-        self.entity_context = nn.Linear(ENTITY_WIDTH, 16)
+        self.entity_context = nn.Linear(ENTITY_WIDTH + ENTITY_STATE_WIDTH, 16)
         self.reach_correction = nn.Sequential(
             nn.Linear(24, 48),
             nn.GELU(),
@@ -124,7 +124,7 @@ class ControlField(nn.Module):
     def _reach(
         self,
         players: torch.Tensor,
-        entity_tokens: torch.Tensor,
+        entity_context: torch.Tensor,
         locations: torch.Tensor,
     ) -> torch.Tensor:
         positions = players[..., :2]
@@ -154,7 +154,7 @@ class ControlField(nn.Module):
             ),
             dim=-1,
         )
-        token_context = self.entity_context(entity_tokens[:, :22])[:, :, None]
+        token_context = self.entity_context(entity_context)[:, :, None]
         token_context = token_context.expand(-1, -1, locations.shape[1], -1)
         correction = self.reach_correction(
             torch.cat((scalar, token_context), dim=-1)
@@ -212,7 +212,10 @@ class ControlField(nn.Module):
         players = torch.cat((own, opponent), dim=1)
         active = players[..., PLAYER_ACTIVE_INDEX] > 0.5
         locations = self.locations[None].expand(players.shape[0], -1, -1)
-        times = self._reach(players, entity_tokens, locations)
+        reach_context = torch.cat(
+            (entity_tokens[:, :22], entity_state[:, :22]), dim=-1
+        )
+        times = self._reach(players, reach_context, locations)
         control, own_times, opponent_times = self._control_from_times(times, active)
         own_weights = torch.softmax(-own_times / 0.1, dim=1)
         opponent_weights = torch.softmax(-opponent_times / 0.1, dim=1)
@@ -237,7 +240,7 @@ class ControlField(nn.Module):
             dim=-1,
         )
         ball_locations = context[:, :2, None].transpose(1, 2)
-        reach_ball = self._reach(players, entity_tokens, ball_locations).squeeze(-1)
+        reach_ball = self._reach(players, reach_context, ball_locations).squeeze(-1)
         return self.position_encoder(position_input), control, reach_ball
 
 
