@@ -2,9 +2,9 @@
 
 Jackaroo is a single-agent recurrent PPO policy for the next-goal objective. It controls the engine-designated player with one of the engine's 32 atomic actions while TeamAI and Eliza control the remaining players. Observations use canonical coordinates, so Jackaroo always attacks toward positive $x$ regardless of its physical side.
 
-Training begins with TamakEri teacher self-play and then continues through shared-policy Jackaroo self-play. Teacher matches initialize executable action behavior and next-goal value estimates before PPO begins. A segment begins at kickoff and ends at the next goal. The scoring side receives $+1$, the conceding side receives $-1$, and both trajectories enter training as separate state-dependent action sequences. A scoreless final segment is excluded from both pretraining and PPO.
+Training begins with pretraining on TamakEri self-play and then continues through shared-policy Jackaroo self-play. The pretraining stage uses behavior cloning to initialize executable action behavior and next-goal value estimates before PPO begins. A segment begins at kickoff and ends at the next goal. The scoring side receives $+1$, the conceding side receives $-1$, and both trajectories enter training as separate state-dependent action sequences. A scoreless final segment is excluded from both pretraining and PPO.
 
-The network combines a 24-token entity Transformer, persistent per-entity and global recurrent state, a DSS-derived spatial-control field, a structured representation of the 32 actions, an action-conditioned transition model, and one next-goal EPV function. The same EPV is the PPO Critic and evaluates predicted action outcomes; there is no separate Q network.
+The network combines a 24-token entity Transformer, persistent per-entity and global recurrent state, direction-aware arrival times, continuous team control, state-dependent spatial quality, a structured representation of the 32 actions, an action-conditioned transition model, and one next-goal value function. The PPO Critic and action-value calculation share this value function.
 
 ## Building
 
@@ -37,7 +37,7 @@ bash training/jackaroo/run.sh
 The formal script first collects 256 complete TamakEri self-play matches in flights of 16 and runs two pretraining epochs. It then collects 256 complete Jackaroo self-play matches per update, retains every scored segment, trains on contiguous sequences of 32 transitions for four PPO epochs, and plays two complete validation matches against built-in AI with seed 42 from opposite physical sides. These values are configurable command-line defaults. The script writes validation replays to `runs/validation`, the process ID to `runs/jackaroo.pid`, the checkpoint to `runs/jackaroo.pt`, and console output to `runs/jackaroo.stdout.log`. Extra command-line arguments override the script defaults.
 
 ```powershell
-python -m training.jackaroo.train --updates 1000 --pretraining-games 256 --pretraining-epochs 2 --pretraining-batch-size 256 --games-per-update 256 --sequence-length 32 --ppo-epochs 4 --ppo-batch-size 256 --flight 16 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --transition-coefficient 0.1 --action-value-coefficient 0.1 --control-coefficient 0.05 --validation-seed 42 --validation-directory runs\validation --device auto --seed 1 --checkpoint runs\jackaroo.pt
+python -m training.jackaroo.train --updates 1000 --pretraining-games 256 --pretraining-epochs 2 --pretraining-batch-size 256 --games-per-update 256 --sequence-length 32 --ppo-epochs 4 --ppo-batch-size 256 --flight 16 --maximum-steps 3000 --learning-rate 0.0001 --entropy-coefficient 0.001 --transition-coefficient 0.1 --action-value-coefficient 0.1 --control-coefficient 0.05 --space-coefficient 0.05 --validation-seed 42 --validation-directory runs\validation --device auto --seed 1 --checkpoint runs\jackaroo.pt
 ```
 
 `--seed` initializes a deterministic sequence of unique 32-bit match seeds, so a run is reproducible while every self-play match receives its own seed. Validation always uses `--validation-seed` twice, once for each physical side. Use `--resume runs\jackaroo.pt` with a new `--updates` value to continue from a compatible checkpoint.
@@ -60,4 +60,4 @@ Export the recurrent policy as a TorchScript module:
 python -m training.jackaroo.export runs\jackaroo.pt models\jackaroo\jackaroo.pt
 ```
 
-The exported module accepts one encoded public observation plus persistent entity and global states, then returns action logits, EPV, and the updated states for native inference.
+The exported module accepts one encoded public observation plus persistent entity and global states, then returns action logits, next-goal value, and the updated states for native inference.

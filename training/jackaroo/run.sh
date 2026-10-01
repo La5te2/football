@@ -52,6 +52,7 @@ nohup env LD_PRELOAD="$PRELOAD" "$PYTHON_BIN" -u \
   --ppo-batch-size 256 \
   --learning-rate 0.0001 \
   --entropy-coefficient 0.001 \
+  --space-coefficient 0.05 \
   --flight 16 \
   --maximum-steps 3000 \
   --validation-seed 42 \

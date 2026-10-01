@@ -40,6 +40,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--transition-coefficient", type=float, default=0.1)
     parser.add_argument("--action-value-coefficient", type=float, default=0.1)
     parser.add_argument("--control-coefficient", type=float, default=0.05)
+    parser.add_argument("--space-coefficient", type=float, default=0.05)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--checkpoint", type=Path, default=Path("runs/jackaroo.pt"))
     parser.add_argument("--log", type=Path)
@@ -87,6 +88,7 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
     nonnegative = (
         "entropy_coefficient", "transition_coefficient",
         "action_value_coefficient", "control_coefficient",
+        "space_coefficient",
     )
     for name in nonnegative:
         if getattr(arguments, name) < 0.0:
@@ -199,6 +201,7 @@ def main() -> None:
             transition_coefficient=arguments.transition_coefficient,
             action_value_coefficient=arguments.action_value_coefficient,
             control_coefficient=arguments.control_coefficient,
+            space_coefficient=arguments.space_coefficient,
             progress=lambda message: _status(f"pretraining optimize {message}"),
         )
         pretraining_metrics = {
@@ -241,6 +244,7 @@ def main() -> None:
             "transition_coefficient": arguments.transition_coefficient,
             "action_value_coefficient": arguments.action_value_coefficient,
             "control_coefficient": arguments.control_coefficient,
+            "space_coefficient": arguments.space_coefficient,
             "objective": POLICY_OBJECTIVE,
             "feature_scaling": "fixed",
             "updates": 0,
@@ -282,6 +286,7 @@ def main() -> None:
             transition_coefficient=arguments.transition_coefficient,
             action_value_coefficient=arguments.action_value_coefficient,
             control_coefficient=arguments.control_coefficient,
+            space_coefficient=arguments.space_coefficient,
             progress=lambda message: _status(f"update={iteration} ppo {message}"),
         )
         ppo_seconds = time.perf_counter() - ppo_started
@@ -343,6 +348,7 @@ def main() -> None:
             f"value={losses['value']:.4f} entropy={losses['entropy']:.4f} "
             f"transition={losses['outcome'] + losses['terminal'] + losses['latent']:.4f} "
             f"q={losses['action_value']:.4f} control={losses['control']:.4f} "
+            f"space={losses['space']:.4f} "
             f"kl={losses['kl']:.5f} clipped={losses['clip_fraction']:.4f} "
             f"engine_steps_s={diagnostics['engine_steps_per_second']:.1f} "
             f"ppo_transitions_s={diagnostics['ppo_transitions_per_second']:.1f} "
@@ -368,6 +374,7 @@ def main() -> None:
             "transition_coefficient": arguments.transition_coefficient,
             "action_value_coefficient": arguments.action_value_coefficient,
             "control_coefficient": arguments.control_coefficient,
+            "space_coefficient": arguments.space_coefficient,
             "objective": POLICY_OBJECTIVE,
             "feature_scaling": "fixed",
             "updates": iteration,

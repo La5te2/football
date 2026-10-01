@@ -10,7 +10,14 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 
-from .attention import PLAYER_ACTIVE_INDEX, TensorFrame, batch_tensor_frames, tensorize
+from .attention import (
+    OPPONENT_POSSESSION_INDEX,
+    OWN_POSSESSION_INDEX,
+    PLAYER_ACTIVE_INDEX,
+    TensorFrame,
+    batch_tensor_frames,
+    tensorize,
+)
 from .env import SelfPlayVectorFootballEnv
 from .network import ActorCritic, RecurrentState
 
@@ -374,6 +381,7 @@ def update(
     transition_coefficient: float = 0.1,
     action_value_coefficient: float = 0.1,
     control_coefficient: float = 0.05,
+    space_coefficient: float = 0.05,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
     """Optimize PPO, EPV, and engine-grounded auxiliary predictions together."""
@@ -389,7 +397,7 @@ def update(
     report_interval = max(batch_count // 4, 1)
     names = (
         "policy", "value", "entropy", "kl", "clip_fraction",
-        "outcome", "terminal", "latent", "action_value", "control",
+        "outcome", "terminal", "latent", "action_value", "control", "space",
     )
     totals = {name: 0.0 for name in names}
     total_samples = 0
@@ -497,11 +505,33 @@ def update(
             else:
                 control_loss = output.reach_ball.sum() * 0.0
 
+            space_target = policy.control.analytic_space_value_target(
+                own.reshape(-1, 11, own.shape[-1]),
+                opponent.reshape(-1, 11, opponent.shape[-1]),
+            ).reshape(*valid.shape, 2, -1)
+            possession = torch.stack(
+                (
+                    context[..., OWN_POSSESSION_INDEX] > 0.5,
+                    context[..., OPPONENT_POSSESSION_INDEX] > 0.5,
+                ),
+                dim=-1,
+            )
+            space_valid = (valid[..., None] & possession)[..., None].expand_as(
+                output.space_values
+            )
+            if space_valid.any():
+                space_loss = nn.functional.smooth_l1_loss(
+                    output.space_values[space_valid], space_target[space_valid]
+                )
+            else:
+                space_loss = output.space_values.sum() * 0.0
+
             loss = (
                 policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
                 + transition_coefficient * (outcome_loss + terminal_loss + latent_loss)
                 + action_value_coefficient * action_value_loss
                 + control_coefficient * control_loss
+                + space_coefficient * space_loss
             )
             if not torch.isfinite(loss):
                 raise FloatingPointError("PPO loss is NaN or Inf")
@@ -519,6 +549,7 @@ def update(
                 "clip_fraction": clip_fraction.item(), "outcome": outcome_loss.item(),
                 "terminal": terminal_loss.item(), "latent": latent_loss.item(),
                 "action_value": action_value_loss.item(), "control": control_loss.item(),
+                "space": space_loss.item(),
             }
             for name, metric in metrics.items():
                 totals[name] += metric * count

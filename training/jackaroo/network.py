@@ -17,7 +17,7 @@ from .attention import (
 )
 
 
-POLICY_ARCHITECTURE = "persistent-entity-control-transition-transformer"
+POLICY_ARCHITECTURE = "persistent-entity-wos-control-transition-transformer"
 POLICY_OBJECTIVE = "next-goal-wdl"
 ENTITY_STATE_WIDTH = 64
 GLOBAL_STATE_WIDTH = 256
@@ -49,6 +49,7 @@ class PolicyOutput(NamedTuple):
     predicted_outcome: torch.Tensor
     terminal_logits: torch.Tensor
     action_values: torch.Tensor
+    space_values: torch.Tensor
     reach_ball: torch.Tensor
 
 
@@ -63,6 +64,7 @@ class SequenceOutput(NamedTuple):
     predicted_outcome: torch.Tensor
     terminal_logits: torch.Tensor
     action_values: torch.Tensor
+    space_values: torch.Tensor
     reach_ball: torch.Tensor
 
 
@@ -100,7 +102,7 @@ def _action_feature_table() -> torch.Tensor:
 
 
 class ControlField(nn.Module):
-    """Compute a DSS prior and an engine-calibrated spatial control field."""
+    """Compute DSS control and WOS-style spatial value on a shared grid."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -114,12 +116,60 @@ class ControlField(nn.Module):
             nn.GELU(),
             nn.Linear(48, 1),
         )
+        self.space_relevance = nn.Sequential(
+            nn.LayerNorm(6),
+            nn.Linear(6, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
         self.position_encoder = nn.Sequential(
-            nn.LayerNorm(136),
-            nn.Linear(136, CONTROL_WIDTH),
+            nn.LayerNorm(138),
+            nn.Linear(138, CONTROL_WIDTH),
             nn.GELU(),
             nn.Linear(CONTROL_WIDTH, CONTROL_WIDTH),
         )
+
+    def _space_value(
+        self,
+        ball_position: torch.Tensor,
+        ball_velocity: torch.Tensor,
+        locations: torch.Tensor,
+    ) -> torch.Tensor:
+        """Estimate attacking value for locations in one team's coordinates."""
+
+        position = ball_position[..., None, :].expand_as(locations)
+        velocity = ball_velocity[..., None, :].expand_as(locations)
+        features = torch.cat((locations, locations - position, velocity), dim=-1)
+        learned_value = torch.sigmoid(self.space_relevance(features).squeeze(-1))
+        goal_proximity = ((locations[..., 0] + 1.0) * 0.5).clamp(0.0, 1.0)
+        return learned_value * goal_proximity
+
+    def space_values(
+        self, ball_position: torch.Tensor, ball_velocity: torch.Tensor
+    ) -> torch.Tensor:
+        """Return own and opponent spatial value in the current coordinates."""
+
+        leading = ball_position.shape[:-1]
+        locations = self.locations.view(
+            *((1,) * len(leading)), CONTROL_LOCATIONS, 2
+        ).expand(*leading, CONTROL_LOCATIONS, 2)
+        own = self._space_value(ball_position, ball_velocity, locations)
+        opponent = self._space_value(-ball_position, -ball_velocity, -locations)
+        return torch.stack((own, opponent), dim=-2)
+
+    def analytic_space_value_target(
+        self, own: torch.Tensor, opponent: torch.Tensor
+    ) -> torch.Tensor:
+        """Build WOS supervision from the defending team's public coverage."""
+
+        control = self.analytic_control(own, opponent)
+        own_goal_proximity = ((self.locations[:, 0] + 1.0) * 0.5).clamp(0.0, 1.0)
+        opponent_goal_proximity = ((1.0 - self.locations[:, 0]) * 0.5).clamp(
+            0.0, 1.0
+        )
+        own = (1.0 - control) * own_goal_proximity
+        opponent = control * opponent_goal_proximity
+        return torch.stack((own, opponent), dim=-2)
 
     def _reach(
         self,
@@ -208,7 +258,7 @@ class ControlField(nn.Module):
         context: torch.Tensor,
         entity_tokens: torch.Tensor,
         entity_state: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         players = torch.cat((own, opponent), dim=1)
         active = players[..., PLAYER_ACTIVE_INDEX] > 0.5
         locations = self.locations[None].expand(players.shape[0], -1, -1)
@@ -226,6 +276,9 @@ class ControlField(nn.Module):
         ball_position = context[:, :2, None].transpose(1, 2)
         ball_velocity = context[:, 3:5, None].transpose(1, 2)
         ball_velocity = ball_velocity.expand(-1, CONTROL_LOCATIONS, -1)
+        space_values = self.space_values(context[:, :2], context[:, 3:5])
+        own_quality = space_values[:, 0] * control
+        opponent_quality = space_values[:, 1] * (1.0 - control)
         margin = opponent_times.min(dim=1).values - own_times.min(dim=1).values
         position_input = torch.cat(
             (
@@ -234,6 +287,8 @@ class ControlField(nn.Module):
                 ball_velocity,
                 control[:, :, None],
                 torch.tanh(margin / 0.2)[:, :, None],
+                own_quality[:, :, None],
+                opponent_quality[:, :, None],
                 own_state,
                 opponent_state,
             ),
@@ -241,7 +296,7 @@ class ControlField(nn.Module):
         )
         ball_locations = context[:, :2, None].transpose(1, 2)
         reach_ball = self._reach(players, reach_context, ball_locations).squeeze(-1)
-        return self.position_encoder(position_input), control, reach_ball
+        return self.position_encoder(position_input), control, space_values, reach_ball
 
 
 class ActorCritic(nn.Module):
@@ -306,7 +361,7 @@ class ActorCritic(nn.Module):
             nn.Linear(RELATION_WIDTH, 1),
             nn.Tanh(),
         )
-        actor_input = RELATION_WIDTH + ACTION_WIDTH + CONTROL_WIDTH
+        actor_input = RELATION_WIDTH + ACTION_WIDTH + CONTROL_WIDTH + 2
         self.actor = nn.Sequential(
             nn.LayerNorm(actor_input),
             nn.Linear(actor_input, RELATION_WIDTH),
@@ -381,10 +436,14 @@ class ActorCritic(nn.Module):
         entity_state = torch.where(
             active[:, :, None], entity_state, torch.zeros_like(entity_state)
         )
-        control_tokens, _, reach_ball = self.control(
+        control_tokens, control, space_values, reach_ball = self.control(
             own, opponent, context, entity_tokens, entity_state
         )
-        control_summary = control_tokens.mean(dim=1)
+        spatial_attention = space_values.sum(dim=1)
+        spatial_attention = spatial_attention / spatial_attention.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-6)
+        control_summary = torch.einsum("bk,bkd->bd", spatial_attention, control_tokens)
         current_global = (
             self.global_encoder(encoded)
             + self.relation_encoder(entity_summary)
@@ -423,8 +482,33 @@ class ActorCritic(nn.Module):
         )
         relation_expanded = relation[:, None].expand(-1, self.action_count, -1)
         outcome_features = self.outcome_encoder(predicted_outcome.detach())
+        detached_outcome = predicted_outcome.detach()
+        predicted_space_values = self.control.space_values(
+            detached_outcome[..., :2], detached_outcome[..., 3:5]
+        )
+        control_begin = 6 + 22 * 4
+        predicted_control = detached_outcome[
+            ..., control_begin:control_begin + CONTROL_LOCATIONS
+        ].clamp(0.0, 1.0)
+        current_quality_margin = (
+            space_values[:, 0] * control
+            - space_values[:, 1] * (1.0 - control)
+        ).mean(dim=-1)
+        predicted_quality_margin = (
+            predicted_space_values[..., 0, :] * predicted_control
+            - predicted_space_values[..., 1, :] * (1.0 - predicted_control)
+        ).mean(dim=-1)
+        space_change = torch.stack(
+            (
+                predicted_quality_margin,
+                predicted_quality_margin - current_quality_margin[:, None],
+            ),
+            dim=-1,
+        )
         base_logits = self.actor(
-            torch.cat((relation_expanded, action, outcome_features), dim=-1)
+            torch.cat(
+                (relation_expanded, action, outcome_features, space_change), dim=-1
+            )
         ).squeeze(-1)
         logits = base_logits + self.action_value_gate * action_values.detach()
         value = self.epv(global_state).squeeze(-1)
@@ -437,6 +521,7 @@ class ActorCritic(nn.Module):
             predicted_outcome,
             terminal_logits,
             action_values,
+            space_values,
             reach_ball,
         )
 
@@ -478,6 +563,7 @@ class ActorCritic(nn.Module):
             torch.stack([output.predicted_outcome for output in outputs], dim=1),
             torch.stack([output.terminal_logits for output in outputs], dim=1),
             torch.stack([output.action_values for output in outputs], dim=1),
+            torch.stack([output.space_values for output in outputs], dim=1),
             torch.stack([output.reach_ball for output in outputs], dim=1),
         )
 

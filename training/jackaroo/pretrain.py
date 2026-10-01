@@ -8,7 +8,14 @@ from typing import Callable
 import torch
 from torch import nn
 
-from .attention import PLAYER_ACTIVE_INDEX, TensorFrame, batch_tensor_frames, tensorize
+from .attention import (
+    OPPONENT_POSSESSION_INDEX,
+    OWN_POSSESSION_INDEX,
+    PLAYER_ACTIVE_INDEX,
+    TensorFrame,
+    batch_tensor_frames,
+    tensorize,
+)
 from .env import SelfPlayVectorFootballEnv
 from .network import ActorCritic, RecurrentState
 from .ppo import Rollout, Segment, Transition, compact_frame, pack_rollout
@@ -230,6 +237,7 @@ def pretrain(
     transition_coefficient: float = 0.1,
     action_value_coefficient: float = 0.1,
     control_coefficient: float = 0.05,
+    space_coefficient: float = 0.05,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
     """Initialize Jackaroo from teacher actions and scored segment outcomes."""
@@ -242,7 +250,7 @@ def pretrain(
     report_interval = max(batch_count // 4, 1)
     names = (
         "behavior", "value", "outcome", "terminal", "latent",
-        "action_value", "control", "accuracy",
+        "action_value", "control", "space", "accuracy",
     )
     totals = {name: 0.0 for name in names}
     weights = {name: 0 for name in names}
@@ -382,6 +390,27 @@ def pretrain(
             else:
                 control_loss = output.reach_ball.sum() * 0.0
 
+            space_target = policy.control.analytic_space_value_target(
+                own.reshape(-1, 11, own.shape[-1]),
+                opponent.reshape(-1, 11, opponent.shape[-1]),
+            ).reshape(*valid.shape, 2, -1)
+            possession = torch.stack(
+                (
+                    context[..., OWN_POSSESSION_INDEX] > 0.5,
+                    context[..., OPPONENT_POSSESSION_INDEX] > 0.5,
+                ),
+                dim=-1,
+            )
+            space_valid = (valid[..., None] & possession)[..., None].expand_as(
+                output.space_values
+            )
+            if space_valid.any():
+                space_loss = nn.functional.smooth_l1_loss(
+                    output.space_values[space_valid], space_target[space_valid]
+                )
+            else:
+                space_loss = output.space_values.sum() * 0.0
+
             loss = (
                 behavior_loss
                 + value_coefficient * value_loss
@@ -390,6 +419,7 @@ def pretrain(
                 )
                 + action_value_coefficient * action_value_loss
                 + control_coefficient * control_loss
+                + space_coefficient * space_loss
             )
             if not torch.isfinite(loss):
                 raise FloatingPointError("pretraining loss is NaN or Inf")
@@ -409,6 +439,7 @@ def pretrain(
                 "latent": int(latent_valid.sum()),
                 "action_value": int(action_value_supervised.sum()),
                 "control": int(reach_valid.sum()),
+                "space": int(space_valid.sum()),
                 "accuracy": supervised_count,
             }
             metrics = {
@@ -416,7 +447,8 @@ def pretrain(
                 "outcome": outcome_loss.item(), "terminal": terminal_loss.item(),
                 "latent": latent_loss.item(),
                 "action_value": action_value_loss.item(),
-                "control": control_loss.item(), "accuracy": accuracy.item(),
+                "control": control_loss.item(), "space": space_loss.item(),
+                "accuracy": accuracy.item(),
             }
             for name, metric in metrics.items():
                 weight = metric_weights[name]
