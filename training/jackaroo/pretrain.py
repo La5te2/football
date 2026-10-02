@@ -1,236 +1,111 @@
-"""TamakEri self-play collection and supervised Jackaroo initialization."""
+"""GPU pretraining from a prepared Jackaroo trajectory dataset."""
 
 from __future__ import annotations
 
-import math
-from typing import Callable
+import argparse
+from pathlib import Path
+from typing import Callable, Iterator
 
+import h5py
+import numpy as np
 import torch
 from torch import nn
 
-from .attention import (
-    OPPONENT_POSSESSION_INDEX,
-    OWN_POSSESSION_INDEX,
-    PLAYER_ACTIVE_INDEX,
-    TensorFrame,
-    batch_tensor_frames,
-    tensorize,
+from .attention import OPPONENT_POSSESSION_INDEX, OWN_POSSESSION_INDEX, PLAYER_ACTIVE_INDEX
+from .network import (
+    ActorCritic,
+    ENTITY_COUNT,
+    ENTITY_STATE_WIDTH,
+    GLOBAL_STATE_WIDTH,
+    POLICY_ARCHITECTURE,
+    POLICY_OBJECTIVE,
+    RecurrentState,
 )
-from .env import SelfPlayVectorFootballEnv
-from .network import ActorCritic, RecurrentState
-from .ppo import Rollout, Segment, Transition, compact_frame, pack_rollout
-from .tamakeri import TamakEriTeacher
 
 
-def _select_state(state: RecurrentState, indices: list[int]) -> RecurrentState:
-    index = torch.tensor(indices, dtype=torch.long, device=state.entities.device)
-    return RecurrentState(
-        state.entities.index_select(0, index),
-        state.global_state.index_select(0, index),
-    )
+class DatasetReader:
+    """Read prepared trajectory batches directly into GPU pretraining."""
 
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file = h5py.File(path, "r")
+        self.sequence_length = int(self._file.attrs["sequence_length"])
+        self.sequence_count = int(self._file.attrs["sequences"])
+        self.frame_size = int(self._file["encoded"].shape[-1])
+        self.transitions = int(self._file.attrs["transitions"])
+        self.matches = int(self._file.attrs["matches"])
+        self.scored_segments = int(self._file.attrs["scored_segments"])
+        self.censored_segments = int(self._file.attrs["censored_segments"])
+        self.trajectory_count = int(self._file.attrs["trajectories"])
+        self.trajectory_ids = self._file["trajectory"][:].astype(np.int64)
+        self.trajectory_ends = self._file["trajectory_end"][:].astype(np.bool_)
+        if self.sequence_count <= 0:
+            raise ValueError("prepared dataset contains no sequences")
+        if self.trajectory_count <= 0:
+            raise ValueError("prepared dataset contains no trajectories")
 
-def _put_state(
-    state: RecurrentState, indices: list[int], selected: RecurrentState
-) -> RecurrentState:
-    index = torch.tensor(indices, dtype=torch.long, device=state.entities.device)
-    entities = state.entities.clone()
-    global_state = state.global_state.clone()
-    entities.index_copy_(0, index, selected.entities)
-    global_state.index_copy_(0, index, selected.global_state)
-    return RecurrentState(entities, global_state)
+    def batches(self, batch_size: int) -> Iterator[np.ndarray]:
+        """Yield shuffled trajectories one ordered truncated sequence at a time."""
 
-
-def _clear_state(state: RecurrentState, index: int) -> RecurrentState:
-    entities = state.entities.clone()
-    global_state = state.global_state.clone()
-    entities[index].zero_()
-    global_state[index].zero_()
-    return RecurrentState(entities, global_state)
-
-
-def _batch_tensor(
-    tensor: torch.Tensor, indices: torch.Tensor, device: torch.device
-) -> torch.Tensor:
-    value = tensor.index_select(0, indices)
-    if value.dtype == torch.float16:
-        value = value.float()
-    return value.to(device, non_blocking=True)
-
-
-def collect_tamakeri_rollout(
-    environment: SelfPlayVectorFootballEnv,
-    teacher: TamakEriTeacher,
-    policy: ActorCritic,
-    games: int,
-    sequence_length: int,
-    progress: Callable[[str], None] | None = None,
-) -> tuple[Rollout, list[tuple[int, int]], list[tuple[int, int]]]:
-    """Run complete TamakEri self-play matches and retain scored segments."""
-
-    if games <= 0 or sequence_length <= 0:
-        raise ValueError("pretraining games and sequence length must be positive")
-    first_flight_size = min(environment.count, games)
-    observations = environment.reset(first_flight_size)
-    teacher.reset()
-    device = next(policy.parameters()).device
-    agent_count = 2 * environment.count
-    recurrent = policy.initial_state(agent_count, device)
-    pending: list[list[Transition]] = [[] for _ in range(agent_count)]
-    retained: list[Segment] = []
-    completed_segments: list[tuple[int, int]] = []
-    completed_matches: list[tuple[int, int]] = []
-    simulated_steps = flight = supervised_steps = 0
-    report_interval = max(500 * environment.count, 1)
-    next_report = report_interval
-    policy.eval()
-
-    while len(completed_matches) < games:
-        flight += 1
-        flight_size = min(environment.count, games - len(completed_matches))
-        if flight > 1:
-            reset_agents: list[int] = []
-            for index in range(flight_size):
-                observations[index] = environment.reset_one(index)
-                reset_agents.extend((2 * index, 2 * index + 1))
-            teacher.reset(reset_agents)
-        active = [index < flight_size for index in range(environment.count)]
-        if progress is not None:
-            progress(
-                f"flight={flight} start matches={len(completed_matches)}/{games} "
-                f"active={flight_size}"
+        sequences_per_batch = max(batch_size // self.sequence_length, 1)
+        grouped: list[list[int]] = [[] for _ in range(self.trajectory_count)]
+        for sequence, trajectory in enumerate(self.trajectory_ids):
+            grouped[int(trajectory)].append(sequence)
+        order = torch.randperm(self.trajectory_count).tolist()
+        cursor = 0
+        active: list[tuple[list[int], int]] = []
+        while cursor < len(order) and len(active) < sequences_per_batch:
+            active.append((grouped[order[cursor]], 0))
+            cursor += 1
+        while active:
+            yield np.asarray(
+                [trajectory[position] for trajectory, position in active],
+                dtype=np.int64,
             )
-        while any(active):
-            agent_indices: list[int] = []
-            frames: list[TensorFrame] = []
-            teacher_observations: list[dict] = []
-            for environment_index in range(environment.count):
-                if not active[environment_index]:
-                    continue
-                for side in range(2):
-                    observation = observations[environment_index][side]
-                    if observation["is_in_play"]:
-                        agent_indices.append(2 * environment_index + side)
-                        frames.append(tensorize(observation))
-                        teacher_observations.append(observation)
+            following: list[tuple[list[int], int]] = []
+            for trajectory, position in active:
+                if position + 1 < len(trajectory):
+                    following.append((trajectory, position + 1))
+                elif cursor < len(order):
+                    following.append((grouped[order[cursor]], 0))
+                    cursor += 1
+            active = following
 
-            decisions = [[[32] * 11, [32] * 11] for _ in range(environment.count)]
-            step_data: dict[
-                int, tuple[TensorFrame, RecurrentState | None, int, bool, float]
-            ] = {}
-            if frames:
-                inputs = batch_tensor_frames(frames, device)
-                before = _select_state(recurrent, agent_indices)
-                with torch.inference_mode():
-                    output = policy.step(*inputs, before)
-                recurrent = _put_state(recurrent, agent_indices, output.state)
-                teacher_decisions = teacher.decide(
-                    teacher_observations, agent_indices
-                )
-                for local, (agent_index, teacher_decision) in enumerate(
-                    zip(agent_indices, teacher_decisions)
-                ):
-                    environment_index, side = divmod(agent_index, 2)
-                    decisions[environment_index][side] = teacher_decision.actions
-                    supervised = teacher_decision.action is not None
-                    action = teacher_decision.action if supervised else 0
-                    supervised_steps += int(supervised)
-                    sequence_start = len(pending[agent_index]) % sequence_length == 0
-                    saved_state = (
-                        RecurrentState(
-                            before.entities[local:local + 1].detach().cpu().half(),
-                            before.global_state[local:local + 1].detach().cpu().half(),
-                        )
-                        if sequence_start else None
-                    )
-                    step_data[agent_index] = (
-                        frames[local], saved_state, action, supervised,
-                        float(output.value[local]),
-                    )
+    def read(
+        self, name: str, indices: np.ndarray, device: torch.device
+    ) -> torch.Tensor:
+        order = np.argsort(indices)
+        value = self._file[name][indices[order]]
+        value = value[np.argsort(order)]
+        tensor = torch.from_numpy(value)
+        if tensor.dtype == torch.float16:
+            tensor = tensor.float()
+        return tensor.to(device, non_blocking=True)
 
-            next_observations, results, segment_done, infos = (
-                environment.step_decisions(decisions, active)
-            )
-            simulated_steps += sum(active)
-            for environment_index in range(environment.count):
-                if not active[environment_index]:
-                    continue
-                for side in range(2):
-                    agent_index = 2 * environment_index + side
-                    if infos[environment_index]["action_applied"][side]:
-                        frame, before, action, supervised, value = step_data[agent_index]
-                        pending[agent_index].append(
-                            Transition(
-                                frame=compact_frame(frame),
-                                next_frame=compact_frame(tensorize(
-                                    next_observations[environment_index][side]
-                                )),
-                                state=before,
-                                action=action,
-                                old_log_probability=0.0,
-                                old_value=value,
-                                action_supervised=supervised,
-                            )
-                        )
-                if segment_done[environment_index]:
-                    result = results[environment_index]
-                    completed_segments.append(
-                        (int(result), infos[environment_index]["segment_steps"])
-                    )
-                    if result:
-                        for side, side_result in ((0, result), (1, -result)):
-                            agent_index = 2 * environment_index + side
-                            if not pending[agent_index]:
-                                raise RuntimeError(
-                                    "a scored teacher segment has no decision"
-                                )
-                            pending[agent_index][-1].next_frame = compact_frame(
-                                tensorize(next_observations[environment_index][side])
-                            )
-                            pending[agent_index][-1].terminal_class = (
-                                1 if side_result == 1 else 2
-                            )
-                            retained.append(
-                                Segment(pending[agent_index], int(side_result))
-                            )
-                    for side in range(2):
-                        agent_index = 2 * environment_index + side
-                        pending[agent_index] = []
-                        recurrent = _clear_state(recurrent, agent_index)
-                    if infos[environment_index]["match_done"]:
-                        completed_matches.append(
-                            tuple(infos[environment_index]["goals"])
-                        )
-                        active[environment_index] = False
-            observations = next_observations
-            if progress is not None and simulated_steps >= next_report:
-                progress(
-                    f"flight={flight} matches={len(completed_matches)}/{games} "
-                    f"engine_steps={simulated_steps} active={sum(active)}/{flight_size} "
-                    f"segments={len(completed_segments)} "
-                    f"scored={sum(result != 0 for result, _ in completed_segments)} "
-                    f"labels={supervised_steps}"
-                )
-                next_report += report_interval
-        if progress is not None:
-            progress(
-                f"flight={flight} complete matches={len(completed_matches)}/{games} "
-                f"segments={len(completed_segments)} "
-                f"scored={sum(result != 0 for result, _ in completed_segments)} "
-                f"labels={supervised_steps}"
-            )
+    def initial_state(
+        self, count: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.zeros(count, ENTITY_COUNT, ENTITY_STATE_WIDTH, device=device),
+            torch.zeros(count, GLOBAL_STATE_WIDTH, device=device),
+        )
 
-    return (
-        pack_rollout(retained, sequence_length),
-        completed_segments,
-        completed_matches,
-    )
+    def close(self) -> None:
+        if self._file:
+            self._file.close()
+            self._file = None
+
+    def __enter__(self) -> "DatasetReader":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def pretrain(
     policy: ActorCritic,
     optimizer: torch.optim.Optimizer,
-    rollout: Rollout,
+    dataset: DatasetReader,
     epochs: int = 2,
     batch_size: int = 256,
     value_coefficient: float = 0.5,
@@ -240,14 +115,10 @@ def pretrain(
     space_coefficient: float = 0.05,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, float]:
-    """Initialize Jackaroo from teacher actions and scored segment outcomes."""
+    """Initialize Jackaroo from compressed teacher trajectories."""
 
     if epochs <= 0 or batch_size <= 0:
         raise ValueError("pretraining epochs and batch size must be positive")
-    sequence_count, sequence_length = rollout.encoded.shape[:2]
-    sequences_per_batch = max(batch_size // sequence_length, 1)
-    batch_count = math.ceil(sequence_count / sequences_per_batch)
-    report_interval = max(batch_count // 4, 1)
     names = (
         "behavior", "value", "outcome", "terminal", "latent",
         "action_value", "control", "space", "accuracy",
@@ -260,65 +131,55 @@ def pretrain(
     for epoch in range(1, epochs + 1):
         epoch_totals = {name: 0.0 for name in names}
         epoch_weights = {name: 0 for name in names}
-        batches = torch.randperm(sequence_count).split(sequences_per_batch)
+        recurrent: dict[int, RecurrentState] = {}
+        batches = list(dataset.batches(batch_size))
+        batch_count = len(batches)
+        report_interval = max(batch_count // 4, 1)
         for batch_number, indices in enumerate(batches, start=1):
-            encoded = _batch_tensor(rollout.encoded, indices, device)
-            own = _batch_tensor(rollout.own, indices, device)
-            opponent = _batch_tensor(rollout.opponent, indices, device)
-            context = _batch_tensor(rollout.context, indices, device)
-            anchor_indices = _batch_tensor(rollout.anchor_indices, indices, device)
-            opponent_anchor_indices = _batch_tensor(
-                rollout.opponent_anchor_indices, indices, device
-            )
-            initial_entity_state = _batch_tensor(
-                rollout.initial_entity_state, indices, device
-            )
-            initial_global_state = _batch_tensor(
-                rollout.initial_global_state, indices, device
-            )
-            valid = _batch_tensor(rollout.valid, indices, device)
-            action_supervision = _batch_tensor(
-                rollout.action_supervision, indices, device
-            )
-            actions = _batch_tensor(rollout.actions, indices, device)
-            returns = _batch_tensor(rollout.returns, indices, device)
-            terminal_classes = _batch_tensor(
-                rollout.terminal_classes, indices, device
-            )
-            next_own = _batch_tensor(rollout.next_own, indices, device)
-            next_opponent = _batch_tensor(rollout.next_opponent, indices, device)
-            next_context = _batch_tensor(rollout.next_context, indices, device)
-            next_anchor_indices = _batch_tensor(
-                rollout.next_anchor_indices, indices, device
-            )
+            read = lambda name: dataset.read(name, indices, device)
+            encoded = read("encoded")
+            own = read("own")
+            opponent = read("opponent")
+            context = read("context")
+            anchor_indices = read("anchor").long()
+            opponent_anchor_indices = read("opponent_anchor").long()
+            valid = read("valid").bool()
+            policy_valid = read("policy_valid").bool()
+            terminal_supervision = read("terminal_supervision").bool()
+            action_supervision = read("action_supervision").bool()
+            actions = read("actions").long()
+            returns = read("returns").float()
+            terminal_classes = read("terminal_classes").long()
+            next_own = read("next_own")
+            next_opponent = read("next_opponent")
+            next_context = read("next_context")
+            next_anchor_indices = read("next_anchor").long()
+            initial_entities, initial_global = dataset.initial_state(len(indices), device)
+            trajectory_ids = dataset.trajectory_ids[indices]
+            for row, trajectory in enumerate(trajectory_ids):
+                state = recurrent.get(int(trajectory))
+                if state is not None:
+                    initial_entities[row] = state.entities
+                    initial_global[row] = state.global_state
+
             supervised = valid & action_supervision
-            value_supervised = valid
-            terminal_supervised = supervised
-            action_value_supervised = supervised
+            value_supervised = policy_valid
+            terminal_supervised = supervised & terminal_supervision
+            action_value_supervised = policy_valid & action_supervision
             output = policy.sequence(
                 encoded, own, opponent, context,
                 anchor_indices, opponent_anchor_indices,
-                RecurrentState(initial_entity_state, initial_global_state),
-                valid,
+                RecurrentState(initial_entities, initial_global), valid,
             )
-            if supervised.any():
-                behavior_loss = nn.functional.cross_entropy(
-                    output.logits[supervised], actions[supervised]
-                )
-                accuracy = (
-                    output.logits[supervised].argmax(dim=-1)
-                    == actions[supervised]
-                ).float().mean()
-            else:
-                behavior_loss = output.logits.sum() * 0.0
-                accuracy = output.logits.sum() * 0.0
-            if value_supervised.any():
-                value_loss = nn.functional.mse_loss(
-                    output.value[value_supervised], returns[value_supervised]
-                )
-            else:
-                value_loss = output.value.sum() * 0.0
-
+            for row, trajectory in enumerate(trajectory_ids):
+                key = int(trajectory)
+                if dataset.trajectory_ends[indices[row]]:
+                    recurrent.pop(key, None)
+                else:
+                    recurrent[key] = RecurrentState(
+                        output.state.entities[row].detach(),
+                        output.state.global_state[row].detach(),
+                    )
             action_index = actions.unsqueeze(-1)
             selected_outcome = output.predicted_outcome.gather(
                 2,
@@ -338,34 +199,49 @@ def pretrain(
             selected_action_value = output.action_values.gather(
                 2, action_index
             ).squeeze(-1)
-            target_outcome = policy.observed_outcome(
-                next_own.reshape(-1, 11, next_own.shape[-1]),
-                next_opponent.reshape(-1, 11, next_opponent.shape[-1]),
-                next_context.reshape(-1, next_context.shape[-1]),
-                next_anchor_indices.reshape(-1),
-            ).reshape(*valid.shape, -1)
+
             if supervised.any():
+                behavior_loss = nn.functional.cross_entropy(
+                    output.logits[supervised], actions[supervised]
+                )
+                accuracy = (
+                    output.logits[supervised].argmax(dim=-1)
+                    == actions[supervised]
+                ).float().mean()
+                target_outcome = policy.observed_outcome(
+                    next_own.reshape(-1, 11, next_own.shape[-1]),
+                    next_opponent.reshape(-1, 11, next_opponent.shape[-1]),
+                    next_context.reshape(-1, next_context.shape[-1]),
+                    next_anchor_indices.reshape(-1),
+                ).reshape(*valid.shape, -1)
                 outcome_loss = nn.functional.mse_loss(
                     selected_outcome[supervised], target_outcome[supervised]
                 )
-                if terminal_supervised.any():
-                    terminal_loss = nn.functional.cross_entropy(
-                        selected_terminal[terminal_supervised],
-                        terminal_classes[terminal_supervised],
-                    )
-                else:
-                    terminal_loss = selected_terminal.sum() * 0.0
-                if action_value_supervised.any():
-                    action_value_loss = nn.functional.mse_loss(
-                        selected_action_value[action_value_supervised],
-                        returns[action_value_supervised],
-                    )
-                else:
-                    action_value_loss = selected_action_value.sum() * 0.0
             else:
-                outcome_loss = selected_outcome.sum() * 0.0
+                zero = output.logits.sum() * 0.0
+                behavior_loss = accuracy = outcome_loss = zero
+
+            if value_supervised.any():
+                value_loss = nn.functional.mse_loss(
+                    output.value[value_supervised], returns[value_supervised]
+                )
+            else:
+                value_loss = output.value.sum() * 0.0
+            if terminal_supervised.any():
+                terminal_loss = nn.functional.cross_entropy(
+                    selected_terminal[terminal_supervised],
+                    terminal_classes[terminal_supervised],
+                )
+            else:
                 terminal_loss = selected_terminal.sum() * 0.0
+            if action_value_supervised.any():
+                action_value_loss = nn.functional.mse_loss(
+                    selected_action_value[action_value_supervised],
+                    returns[action_value_supervised],
+                )
+            else:
                 action_value_loss = selected_action_value.sum() * 0.0
+
             latent_valid = supervised[:, :-1] & valid[:, 1:]
             latent_valid &= terminal_classes[:, :-1] == 0
             if latent_valid.any():
@@ -430,17 +306,16 @@ def pretrain(
                 raise FloatingPointError("pretraining gradient norm is NaN or Inf")
             optimizer.step()
 
-            supervised_count = int(supervised.sum())
             metric_weights = {
-                "behavior": supervised_count,
+                "behavior": int(supervised.sum()),
                 "value": int(value_supervised.sum()),
-                "outcome": supervised_count,
+                "outcome": int(supervised.sum()),
                 "terminal": int(terminal_supervised.sum()),
                 "latent": int(latent_valid.sum()),
                 "action_value": int(action_value_supervised.sum()),
                 "control": int(reach_valid.sum()),
                 "space": int(space_valid.sum()),
-                "accuracy": supervised_count,
+                "accuracy": int(supervised.sum()),
             }
             metrics = {
                 "behavior": behavior_loss.item(), "value": value_loss.item(),
@@ -467,6 +342,111 @@ def pretrain(
                 f"value={epoch_totals['value'] / max(epoch_weights['value'], 1):.4f} "
                 f"accuracy={epoch_totals['accuracy'] / max(epoch_weights['accuracy'], 1):.4f}"
             )
-    return {
-        name: value / max(weights[name], 1) for name, value in totals.items()
-    }
+    return {name: totals[name] / max(weights[name], 1) for name in names}
+
+
+def _status(message: str) -> None:
+    print(f"status={message}", flush=True)
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=Path, default=Path("runs/tamakeri.h5"))
+    parser.add_argument("--checkpoint", type=Path, default=Path("runs/jackaroo.pt"))
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--maximum-steps", type=int, default=3000)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--transition-coefficient", type=float, default=0.1)
+    parser.add_argument("--action-value-coefficient", type=float, default=0.1)
+    parser.add_argument("--control-coefficient", type=float, default=0.05)
+    parser.add_argument("--space-coefficient", type=float, default=0.05)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--seed", type=int, default=1)
+    return parser.parse_args()
+
+
+def main() -> None:
+    arguments = parse_arguments()
+    if arguments.epochs <= 0 or arguments.batch_size <= 0:
+        raise ValueError("epochs and batch size must be positive")
+    if arguments.maximum_steps <= 0 or arguments.learning_rate <= 0.0:
+        raise ValueError("maximum steps and learning rate must be positive")
+    for name in (
+        "transition_coefficient", "action_value_coefficient",
+        "control_coefficient", "space_coefficient",
+    ):
+        if getattr(arguments, name) < 0.0:
+            raise ValueError(f"{name.replace('_', '-')} must be nonnegative")
+    device = torch.device(
+        "cuda"
+        if arguments.device == "auto" and torch.cuda.is_available()
+        else "cpu" if arguments.device == "auto" else arguments.device
+    )
+    torch.manual_seed(arguments.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(arguments.seed)
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+    with DatasetReader(arguments.data) as dataset:
+        policy = ActorCritic(dataset.frame_size, 32).to(device)
+        optimizer = torch.optim.Adam(
+            policy.parameters(), lr=arguments.learning_rate
+        )
+        parameter_count = sum(parameter.numel() for parameter in policy.parameters())
+        _status(
+            f"pretraining start device={device.type} data={arguments.data} "
+            f"matches={dataset.matches} transitions={dataset.transitions} "
+            f"sequences={dataset.sequence_count} epochs={arguments.epochs}"
+        )
+        losses = pretrain(
+            policy,
+            optimizer,
+            dataset,
+            epochs=arguments.epochs,
+            batch_size=arguments.batch_size,
+            transition_coefficient=arguments.transition_coefficient,
+            action_value_coefficient=arguments.action_value_coefficient,
+            control_coefficient=arguments.control_coefficient,
+            space_coefficient=arguments.space_coefficient,
+            progress=lambda message: _status(f"pretraining {message}"),
+        )
+        pretraining_metrics = {
+            "teacher": "tamakeri",
+            "dataset": str(arguments.data),
+            "games": dataset.matches,
+            "scored_segments": dataset.scored_segments,
+            "censored_segments": dataset.censored_segments,
+            "transitions": dataset.transitions,
+            "losses": losses,
+        }
+        checkpoint = {
+            "architecture": POLICY_ARCHITECTURE,
+            "parameter_count": parameter_count,
+            "model": policy.state_dict(),
+            "frame_size": dataset.frame_size,
+            "action_count": 32,
+            "maximum_steps": arguments.maximum_steps,
+            "sequence_length": dataset.sequence_length,
+            "sampled_matches": 0,
+            "seed": arguments.seed,
+            "objective": POLICY_OBJECTIVE,
+            "feature_scaling": "fixed",
+            "updates": 0,
+            "pretraining": pretraining_metrics,
+            "diagnostics": {},
+            "evaluation": {},
+            "optimizer": optimizer.state_dict(),
+        }
+    arguments.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    temporary = arguments.checkpoint.with_name(arguments.checkpoint.name + ".tmp")
+    torch.save(checkpoint, temporary)
+    temporary.replace(arguments.checkpoint)
+    _status(
+        f"pretraining complete accuracy={losses['accuracy']:.4f} "
+        f"checkpoint={arguments.checkpoint}"
+    )
+
+
+if __name__ == "__main__":
+    main()

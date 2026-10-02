@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import math
 from typing import Callable
@@ -57,6 +58,8 @@ class Rollout:
     initial_entity_state: torch.Tensor
     initial_global_state: torch.Tensor
     valid: torch.Tensor
+    policy_valid: torch.Tensor
+    terminal_supervision: torch.Tensor
     actions: torch.Tensor
     old_log_probabilities: torch.Tensor
     advantages: torch.Tensor
@@ -143,10 +146,14 @@ def _batch_tensor(
 def pack_rollout(segments: list[Segment], sequence_length: int) -> Rollout:
     chunks: list[list[Transition]] = []
     chunk_results: list[int] = []
+    chunk_ends_segment: list[bool] = []
     for segment in segments:
         for start in range(0, len(segment.transitions), sequence_length):
             chunks.append(segment.transitions[start:start + sequence_length])
             chunk_results.append(segment.result)
+            chunk_ends_segment.append(
+                start + sequence_length >= len(segment.transitions)
+            )
     if not chunks:
         raise RuntimeError("rollout contains no retained segment")
 
@@ -154,6 +161,10 @@ def pack_rollout(segments: list[Segment], sequence_length: int) -> Rollout:
     following = _stack_padded_frames(chunks, sequence_length, True)
     sequence_count = len(chunks)
     valid = torch.zeros(sequence_count, sequence_length, dtype=torch.bool)
+    policy_valid = torch.zeros(sequence_count, sequence_length, dtype=torch.bool)
+    terminal_supervision = torch.zeros(
+        sequence_count, sequence_length, dtype=torch.bool
+    )
     actions = torch.zeros(sequence_count, sequence_length, dtype=torch.long)
     old_log_probabilities = torch.zeros(sequence_count, sequence_length)
     old_values = torch.zeros(sequence_count, sequence_length)
@@ -163,10 +174,17 @@ def pack_rollout(segments: list[Segment], sequence_length: int) -> Rollout:
     initial_entities = []
     initial_globals = []
     transition_count = 0
-    for index, (chunk, result) in enumerate(zip(chunks, chunk_results)):
+    for index, (chunk, result, ends_segment) in enumerate(
+        zip(chunks, chunk_results, chunk_ends_segment)
+    ):
         count = len(chunk)
         transition_count += count
         valid[index, :count] = True
+        if result:
+            policy_valid[index, :count] = True
+        terminal_supervision[index, :count] = True
+        if result == 0 and ends_segment:
+            terminal_supervision[index, count - 1] = False
         actions[index, :count] = torch.tensor([item.action for item in chunk])
         old_log_probabilities[index, :count] = torch.tensor(
             [item.old_log_probability for item in chunk]
@@ -193,6 +211,8 @@ def pack_rollout(segments: list[Segment], sequence_length: int) -> Rollout:
         torch.cat(initial_entities).to(torch.float16),
         torch.cat(initial_globals).to(torch.float16),
         valid,
+        policy_valid,
+        terminal_supervision,
         actions,
         old_log_probabilities,
         returns - old_values,
@@ -215,12 +235,12 @@ def collect_self_play_rollout(
     list[tuple[int, int]],
     list[tuple[int, int]],
 ]:
-    """Collect scored segments from full shared-policy self-play matches."""
+    """Collect full matches with independently scheduled native simulations."""
 
     if games <= 0 or sequence_length <= 0:
         raise ValueError("rollout games and sequence length must be positive")
-    first_flight_size = min(environment.count, games)
-    observations = environment.reset(first_flight_size)
+    initial_count = min(environment.count, games)
+    observations = environment.reset(initial_count)
     device = next(policy.parameters()).device
     agent_count = 2 * environment.count
     recurrent = policy.initial_state(agent_count, device)
@@ -228,139 +248,161 @@ def collect_self_play_rollout(
     retained: list[Segment] = []
     completed_segments: list[tuple[int, int]] = []
     completed_matches: list[tuple[int, int]] = []
-    simulated_steps = flight = 0
+    simulated_steps = 0
     report_interval = max(500 * environment.count, 1)
     next_report = report_interval
     policy.eval()
+    ready = set(range(initial_count))
+    reset_slots: set[int] = set()
+    started_matches = initial_count
+    StepData = dict[
+        int, tuple[TensorFrame, RecurrentState | None, int, float, float]
+    ]
+    inflight: dict[Future, tuple[int, StepData]] = {}
 
-    while len(completed_matches) < games:
-        flight += 1
-        flight_size = min(environment.count, games - len(completed_matches))
-        if flight > 1:
-            for index in range(flight_size):
-                observations[index] = environment.reset_one(index)
-        active = [index < flight_size for index in range(environment.count)]
-        if progress is not None:
-            progress(
-                f"flight={flight} start matches={len(completed_matches)}/{games} "
-                f"active={flight_size}"
-            )
-        while any(active):
-            decision_indices: list[int] = []
-            frames: list[TensorFrame] = []
-            for environment_index in range(environment.count):
-                if not active[environment_index]:
-                    continue
-                for side in range(2):
-                    if observations[environment_index][side]["is_in_play"]:
-                        decision_indices.append(2 * environment_index + side)
-                        frames.append(tensorize(observations[environment_index][side]))
-            actions = [[0, 0] for _ in range(environment.count)]
-            decisions: dict[
-                int, tuple[TensorFrame, RecurrentState | None, int, float, float]
-            ] = {}
-            if frames:
-                inputs = batch_tensor_frames(frames, device)
-                before = _select_state(recurrent, decision_indices)
-                with torch.inference_mode():
-                    distribution, output = policy.distributions(*inputs, before)
-                    sampled = distribution.sample()
-                    log_probability = distribution.log_prob(sampled)
-                recurrent = _put_state(recurrent, decision_indices, output.state)
-                for local, agent_index in enumerate(decision_indices):
-                    action = int(sampled[local])
-                    environment_index, side = divmod(agent_index, 2)
-                    actions[environment_index][side] = action
-                    sequence_start = len(pending[agent_index]) % sequence_length == 0
-                    saved_state = (
-                        RecurrentState(
-                            before.entities[local:local + 1].detach().cpu().half(),
-                            before.global_state[local:local + 1].detach().cpu().half(),
-                        )
-                        if sequence_start else None
+    def submit_ready(executor: ThreadPoolExecutor) -> None:
+        nonlocal recurrent
+        if not ready:
+            return
+        slots = sorted(ready)
+        ready.clear()
+        decision_indices: list[int] = []
+        frames: list[TensorFrame] = []
+        for environment_index in slots:
+            for side in range(2):
+                observation = observations[environment_index][side]
+                if observation["is_in_play"]:
+                    decision_indices.append(2 * environment_index + side)
+                    frames.append(tensorize(observation))
+        decisions = {
+            index: [[32] * 11, [32] * 11] for index in slots
+        }
+        step_data: dict[int, StepData] = {index: {} for index in slots}
+        if frames:
+            inputs = batch_tensor_frames(frames, device)
+            before = _select_state(recurrent, decision_indices)
+            with torch.inference_mode():
+                distribution, output = policy.distributions(*inputs, before)
+                sampled = distribution.sample()
+                log_probability = distribution.log_prob(sampled)
+            recurrent = _put_state(recurrent, decision_indices, output.state)
+            for local, agent_index in enumerate(decision_indices):
+                action = int(sampled[local])
+                environment_index, side = divmod(agent_index, 2)
+                observation = observations[environment_index][side]
+                player = observation["team_state"][0][
+                    "designated_possession_player"
+                ]
+                if 0 <= player < 11 and observation["teams"][0][player]["is_active"]:
+                    decisions[environment_index][side][player] = action
+                sequence_start = len(pending[agent_index]) % sequence_length == 0
+                saved_state = (
+                    RecurrentState(
+                        before.entities[local:local + 1].detach().cpu().half(),
+                        before.global_state[local:local + 1].detach().cpu().half(),
                     )
-                    decisions[agent_index] = (
-                        frames[local],
-                        saved_state,
+                    if sequence_start else None
+                )
+                step_data[environment_index][agent_index] = (
+                    frames[local], saved_state, action,
+                    float(log_probability[local]), float(output.value[local]),
+                )
+        for environment_index in slots:
+            future = executor.submit(
+                environment.step_decision_one,
+                environment_index,
+                decisions[environment_index],
+            )
+            inflight[future] = (environment_index, step_data[environment_index])
+
+    def accept(future: Future) -> None:
+        nonlocal recurrent, simulated_steps
+        expected_index, step_data = inflight.pop(future)
+        environment_index, current, result, ended, info = future.result()
+        if environment_index != expected_index:
+            raise RuntimeError("asynchronous environment returned the wrong slot")
+        observations[environment_index] = current
+        simulated_steps += 1
+        for side in range(2):
+            agent_index = 2 * environment_index + side
+            if info["action_applied"][side]:
+                frame, before, action, log_probability, value = step_data[agent_index]
+                pending[agent_index].append(
+                    Transition(
+                        compact_frame(frame),
+                        compact_frame(tensorize(current[side])),
+                        before,
                         action,
-                        float(log_probability[local]),
-                        float(output.value[local]),
+                        log_probability,
+                        value,
                     )
+                )
+        if ended:
+            completed_segments.append((int(result), info["segment_steps"]))
+            for side, side_result in ((0, result), (1, -result)):
+                agent_index = 2 * environment_index + side
+                transitions = pending[agent_index]
+                if not transitions:
+                    if side_result:
+                        raise RuntimeError(
+                            "a scored self-play segment has no policy decision"
+                        )
+                else:
+                    transitions[-1].next_frame = compact_frame(
+                        tensorize(current[side])
+                    )
+                    if side_result:
+                        transitions[-1].terminal_class = (
+                            1 if side_result == 1 else 2
+                        )
+                    retained.append(Segment(transitions, int(side_result)))
+                pending[agent_index] = []
+                recurrent = _clear_state(recurrent, agent_index)
+            if info["match_done"]:
+                completed_matches.append(tuple(info["goals"]))
+                reset_slots.add(environment_index)
+            else:
+                ready.add(environment_index)
+        else:
+            ready.add(environment_index)
 
-            next_observations, results, segment_done, infos = environment.step(
-                actions, active
-            )
-            simulated_steps += sum(active)
-            for environment_index in range(environment.count):
-                if not active[environment_index]:
-                    continue
-                for side in range(2):
-                    agent_index = 2 * environment_index + side
-                    if infos[environment_index]["action_applied"][side]:
-                        frame, before, action, log_probability, value = decisions[
-                            agent_index
-                        ]
-                        pending[agent_index].append(
-                            Transition(
-                                compact_frame(frame),
-                                compact_frame(tensorize(
-                                    next_observations[environment_index][side]
-                                )),
-                                before,
-                                action,
-                                log_probability,
-                                value,
-                            )
-                        )
-                if segment_done[environment_index]:
-                    left_result = infos[environment_index]["segment_result"]
-                    result = results[environment_index]
-                    if left_result != result:
-                        raise RuntimeError("self-play segment result is inconsistent")
-                    if result not in (-1, 0, 1):
-                        raise RuntimeError("completed segment has no WDL result")
-                    completed_segments.append(
-                        (int(result), infos[environment_index]["segment_steps"])
-                    )
-                    if result:
-                        for side, side_result in ((0, result), (1, -result)):
-                            agent_index = 2 * environment_index + side
-                            if not pending[agent_index]:
-                                raise RuntimeError(
-                                    "a scored self-play segment has no policy decision"
-                                )
-                            pending[agent_index][-1].next_frame = compact_frame(
-                                tensorize(next_observations[environment_index][side])
-                            )
-                            pending[agent_index][-1].terminal_class = (
-                                1 if side_result == 1 else 2
-                            )
-                            retained.append(
-                                Segment(pending[agent_index], int(side_result))
-                            )
-                    for side in range(2):
-                        agent_index = 2 * environment_index + side
-                        pending[agent_index] = []
-                        recurrent = _clear_state(recurrent, agent_index)
-                    if infos[environment_index]["match_done"]:
-                        completed_matches.append(
-                            tuple(infos[environment_index]["goals"])
-                        )
-                        active[environment_index] = False
-            observations = next_observations
+    if progress is not None:
+        progress(f"asynchronous start matches=0/{games} active={initial_count}")
+    with ThreadPoolExecutor(max_workers=environment.count) as executor:
+        while len(completed_matches) < games:
+            if reset_slots and inflight:
+                done, _ = wait(tuple(inflight), return_when=FIRST_COMPLETED)
+                for future in done:
+                    accept(future)
+                continue
+            if reset_slots and not inflight:
+                for index in sorted(reset_slots):
+                    if started_matches < games:
+                        observations[index] = environment.reset_one(index)
+                        started_matches += 1
+                        ready.add(index)
+                reset_slots.clear()
+            submit_ready(executor)
+            if inflight:
+                done, _ = wait(tuple(inflight), return_when=FIRST_COMPLETED)
+                done.update(future for future in inflight if future.done())
+                for future in done:
+                    accept(future)
             if progress is not None and simulated_steps >= next_report:
                 progress(
-                    f"flight={flight} matches={len(completed_matches)}/{games} "
-                    f"engine_steps={simulated_steps} active={sum(active)}/{flight_size} "
-                    f"segments={len(completed_segments)} scored={len(retained) // 2}"
+                    f"matches={len(completed_matches)}/{games} "
+                    f"engine_steps={simulated_steps} inflight={len(inflight)} "
+                    f"segments={len(completed_segments)} "
+                    f"scored={sum(result != 0 for result, _ in completed_segments)}"
                 )
                 next_report += report_interval
-        if progress is not None:
-            progress(
-                f"flight={flight} complete matches={len(completed_matches)}/{games} "
-                f"engine_steps={simulated_steps} segments={len(completed_segments)} "
-                f"scored={len(retained) // 2}"
-            )
+
+    if progress is not None:
+        progress(
+            f"asynchronous complete matches={len(completed_matches)}/{games} "
+            f"engine_steps={simulated_steps} segments={len(completed_segments)} "
+            f"scored={sum(result != 0 for result, _ in completed_segments)}"
+        )
 
     return (
         pack_rollout(retained, sequence_length),
@@ -386,11 +428,12 @@ def update(
 ) -> dict[str, float]:
     """Optimize PPO, EPV, and engine-grounded auxiliary predictions together."""
 
-    valid_advantages = rollout.advantages[rollout.valid]
+    valid_advantages = rollout.advantages[rollout.policy_valid]
     normalized_advantages = torch.zeros_like(rollout.advantages)
-    normalized_advantages[rollout.valid] = (
-        valid_advantages - valid_advantages.mean()
-    ) / (valid_advantages.std(unbiased=False) + 1e-8)
+    if valid_advantages.numel():
+        normalized_advantages[rollout.policy_valid] = (
+            valid_advantages - valid_advantages.mean()
+        ) / (valid_advantages.std(unbiased=False) + 1e-8)
     sequence_count, sequence_length = rollout.encoded.shape[:2]
     sequences_per_batch = max(batch_size // sequence_length, 1)
     batch_count = math.ceil(sequence_count / sequences_per_batch)
@@ -400,13 +443,13 @@ def update(
         "outcome", "terminal", "latent", "action_value", "control", "space",
     )
     totals = {name: 0.0 for name in names}
-    total_samples = 0
+    weights = {name: 0 for name in names}
     device = next(policy.parameters()).device
     policy.train()
 
     for epoch in range(1, epochs + 1):
         epoch_totals = {name: 0.0 for name in names}
-        epoch_samples = 0
+        epoch_weights = {name: 0 for name in names}
         batches = torch.randperm(sequence_count).split(sequences_per_batch)
         for batch_number, indices in enumerate(batches, start=1):
             encoded = _batch_tensor(rollout.encoded, indices, device)
@@ -424,6 +467,10 @@ def update(
                 rollout.initial_global_state, indices, device
             )
             valid = _batch_tensor(rollout.valid, indices, device)
+            policy_valid = _batch_tensor(rollout.policy_valid, indices, device)
+            terminal_supervision = _batch_tensor(
+                rollout.terminal_supervision, indices, device
+            )
             actions = _batch_tensor(rollout.actions, indices, device)
             old_log_probability = _batch_tensor(
                 rollout.old_log_probabilities, indices, device
@@ -451,13 +498,22 @@ def update(
             ratio = log_ratio.exp()
             unclipped = ratio * advantages
             clipped = ratio.clamp(1.0 - clip_ratio, 1.0 + clip_ratio) * advantages
-            policy_loss = -torch.minimum(unclipped, clipped)[valid].mean()
-            value_loss = nn.functional.mse_loss(
-                output.value[valid], returns[valid]
-            )
-            entropy = distribution.entropy()[valid].mean()
-            approximate_kl = ((ratio - 1.0) - log_ratio)[valid].mean()
-            clip_fraction = ((ratio - 1.0).abs() > clip_ratio)[valid].float().mean()
+            if policy_valid.any():
+                policy_loss = -torch.minimum(unclipped, clipped)[policy_valid].mean()
+                value_loss = nn.functional.mse_loss(
+                    output.value[policy_valid], returns[policy_valid]
+                )
+                entropy = distribution.entropy()[policy_valid].mean()
+                approximate_kl = (
+                    (ratio - 1.0) - log_ratio
+                )[policy_valid].mean()
+                clip_fraction = (
+                    (ratio - 1.0).abs() > clip_ratio
+                )[policy_valid].float().mean()
+            else:
+                zero = output.value.sum() * 0.0
+                policy_loss = value_loss = entropy = approximate_kl = zero
+                clip_fraction = zero
 
             action_index = actions.unsqueeze(-1)
             selected_outcome = output.predicted_outcome.gather(
@@ -477,9 +533,13 @@ def update(
                 next_anchor_indices.reshape(-1),
             ).reshape(*valid.shape, -1)
             outcome_loss = nn.functional.mse_loss(selected_outcome[valid], target_outcome[valid])
-            terminal_loss = nn.functional.cross_entropy(
-                selected_terminal[valid], terminal_classes[valid]
-            )
+            if terminal_supervision.any():
+                terminal_loss = nn.functional.cross_entropy(
+                    selected_terminal[terminal_supervision],
+                    terminal_classes[terminal_supervision],
+                )
+            else:
+                terminal_loss = selected_terminal.sum() * 0.0
             latent_valid = valid[:, :-1] & valid[:, 1:]
             latent_valid &= terminal_classes[:, :-1] == 0
             if latent_valid.any():
@@ -489,9 +549,12 @@ def update(
                 )
             else:
                 latent_loss = selected_latent.sum() * 0.0
-            action_value_loss = nn.functional.mse_loss(
-                selected_action_value[valid], returns[valid]
-            )
+            if policy_valid.any():
+                action_value_loss = nn.functional.mse_loss(
+                    selected_action_value[policy_valid], returns[policy_valid]
+                )
+            else:
+                action_value_loss = selected_action_value.sum() * 0.0
 
             players = torch.cat((own, opponent), dim=2)
             reach_target = players[..., 20]
@@ -542,7 +605,6 @@ def update(
                 raise FloatingPointError("PPO gradient norm is NaN or Inf")
             optimizer.step()
 
-            count = int(valid.sum())
             metrics = {
                 "policy": policy_loss.item(), "value": value_loss.item(),
                 "entropy": entropy.item(), "kl": approximate_kl.item(),
@@ -551,11 +613,22 @@ def update(
                 "action_value": action_value_loss.item(), "control": control_loss.item(),
                 "space": space_loss.item(),
             }
+            policy_count = int(policy_valid.sum())
+            metric_weights = {
+                "policy": policy_count, "value": policy_count,
+                "entropy": policy_count, "kl": policy_count,
+                "clip_fraction": policy_count, "outcome": int(valid.sum()),
+                "terminal": int(terminal_supervision.sum()),
+                "latent": int(latent_valid.sum()),
+                "action_value": policy_count, "control": int(reach_valid.sum()),
+                "space": int(space_valid.sum()),
+            }
             for name, metric in metrics.items():
-                totals[name] += metric * count
-                epoch_totals[name] += metric * count
-            total_samples += count
-            epoch_samples += count
+                weight = metric_weights[name]
+                totals[name] += metric * weight
+                weights[name] += weight
+                epoch_totals[name] += metric * weight
+                epoch_weights[name] += weight
             if progress is not None and (
                 batch_number % report_interval == 0 or batch_number == batch_count
             ):
@@ -563,10 +636,10 @@ def update(
         if progress is not None:
             progress(
                 f"epoch={epoch}/{epochs} complete "
-                f"policy={epoch_totals['policy'] / epoch_samples:.4f} "
-                f"value={epoch_totals['value'] / epoch_samples:.4f} "
-                f"transition={(epoch_totals['outcome'] + epoch_totals['terminal'] + epoch_totals['latent']) / epoch_samples:.4f} "
-                f"q={epoch_totals['action_value'] / epoch_samples:.4f} "
-                f"entropy={epoch_totals['entropy'] / epoch_samples:.4f}"
+                f"policy={epoch_totals['policy'] / max(epoch_weights['policy'], 1):.4f} "
+                f"value={epoch_totals['value'] / max(epoch_weights['value'], 1):.4f} "
+                f"transition={sum(epoch_totals[name] / max(epoch_weights[name], 1) for name in ('outcome', 'terminal', 'latent')):.4f} "
+                f"q={epoch_totals['action_value'] / max(epoch_weights['action_value'], 1):.4f} "
+                f"entropy={epoch_totals['entropy'] / max(epoch_weights['entropy'], 1):.4f}"
             )
-    return {name: value / total_samples for name, value in totals.items()}
+    return {name: totals[name] / max(weights[name], 1) for name in names}

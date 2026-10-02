@@ -164,6 +164,16 @@ class TrainingEnvironmentBatch {
     return self_play_observations_;
   }
 
+  TrainingObservationPair StepSelfPlayOne(
+      int index, const TrainingDecisionPair& actions) {
+    if (index < 0 || index >= size()) {
+      throw std::out_of_range("environment index is out of range");
+    }
+    self_play_observations_[index] =
+        environments_[index]->StepSelfPlay(actions);
+    return self_play_observations_[index];
+  }
+
  private:
   void Worker(int index) {
     std::size_t observed_generation = 0;
@@ -994,6 +1004,58 @@ PyObject* StepSelfPlayBatch(PyObject*, PyObject* arguments) {
   });
 }
 
+PyObject* StepSelfPlayBatchOne(PyObject*, PyObject* arguments) {
+  PyObject* capsule = nullptr;
+  int index = 0;
+  PyObject* decisions_object = nullptr;
+  if (!PyArg_ParseTuple(arguments, "OiO", &capsule, &index,
+                        &decisions_object)) {
+    return nullptr;
+  }
+  TrainingEnvironmentBatch* environment = GetBatchEnvironment(capsule);
+  if (!environment) return nullptr;
+  if (index < 0 || index >= environment->size()) {
+    PyErr_SetString(PyExc_IndexError, "environment index is out of range");
+    return nullptr;
+  }
+  PyObject* pair = PySequence_Fast(
+      decisions_object,
+      "a self-play decision must contain left and right teams");
+  if (!pair) return nullptr;
+  if (PySequence_Fast_GET_SIZE(pair) != 2) {
+    Py_DECREF(pair);
+    PyErr_SetString(PyExc_ValueError,
+                    "a self-play decision must contain two teams");
+    return nullptr;
+  }
+  TrainingDecisionPair decisions;
+  bool valid = true;
+  for (int side = 0; side < 2; ++side) {
+    valid = DecisionFromPython(PySequence_Fast_GET_ITEM(pair, side),
+                               &decisions[side]);
+    if (!valid) break;
+  }
+  Py_DECREF(pair);
+  if (!valid) return nullptr;
+  return TranslateExceptions([&]() -> PyObject* {
+    const TrainingObservationPair observations = RunWithoutGil(
+        [&]() { return environment->StepSelfPlayOne(index, decisions); });
+    PyObject* result = PyTuple_New(2);
+    PyObject* observation_pair = ObservationPairToPython(observations);
+    PyObject* terminated = PyBool_FromLong(
+        observations[0].step >= environment->maximum_steps());
+    if (!result || !observation_pair || !terminated) {
+      Py_XDECREF(result);
+      Py_XDECREF(observation_pair);
+      Py_XDECREF(terminated);
+      return nullptr;
+    }
+    PyTuple_SET_ITEM(result, 0, observation_pair);
+    PyTuple_SET_ITEM(result, 1, terminated);
+    return result;
+  });
+}
+
 PyMethodDef methods[] = {
     {"create", reinterpret_cast<PyCFunction>(Create),
      METH_VARARGS | METH_KEYWORDS, "Create one native training environment."},
@@ -1018,6 +1080,8 @@ PyMethodDef methods[] = {
      "Reset one native self-play environment."},
     {"step_self_play_batch", StepSelfPlayBatch, METH_VARARGS,
      "Advance both teams in active self-play environments concurrently."},
+    {"step_self_play_batch_one", StepSelfPlayBatchOne, METH_VARARGS,
+     "Advance one native self-play environment for asynchronous sampling."},
     {nullptr, nullptr, 0, nullptr},
 };
 

@@ -14,9 +14,7 @@ from .env import FootballEnv, SelfPlayVectorFootballEnv
 from .evaluate import evaluate_policy
 from .features import encode
 from .network import ActorCritic, POLICY_ARCHITECTURE, POLICY_OBJECTIVE
-from .pretrain import collect_tamakeri_rollout, pretrain
 from .ppo import collect_self_play_rollout, update
-from .tamakeri import TAMAKERI_WEIGHTS, TamakEriTeacher
 
 
 def _status(message: str) -> None:
@@ -26,9 +24,6 @@ def _status(message: str) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--updates", type=int, default=1000)
-    parser.add_argument("--pretraining-games", type=int, default=256)
-    parser.add_argument("--pretraining-epochs", type=int, default=2)
-    parser.add_argument("--pretraining-batch-size", type=int, default=256)
     parser.add_argument("--games-per-update", type=int, default=256)
     parser.add_argument("--flight", type=int, default=16)
     parser.add_argument("--maximum-steps", type=int, default=3000)
@@ -68,21 +63,18 @@ def _append_log(path: Path, record: dict[str, Any]) -> None:
 
 def _validate_arguments(arguments: argparse.Namespace) -> None:
     positive = (
-        "updates", "flight", "maximum_steps",
+        "flight", "maximum_steps",
         "sequence_length", "ppo_epochs", "ppo_batch_size",
     )
     for name in positive:
         if getattr(arguments, name) <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive")
-    nonnegative_integers = ("games_per_update", "pretraining_games")
+    nonnegative_integers = ("updates", "games_per_update")
     for name in nonnegative_integers:
         if getattr(arguments, name) < 0:
             raise ValueError(f"{name.replace('_', '-')} must be nonnegative")
     if arguments.games_per_update == 0 and arguments.updates > 0:
         raise ValueError("games-per-update must be positive when updates are requested")
-    if arguments.pretraining_games:
-        if arguments.pretraining_epochs <= 0 or arguments.pretraining_batch_size <= 0:
-            raise ValueError("pretraining epochs and batch size must be positive")
     if arguments.learning_rate <= 0.0:
         raise ValueError("learning-rate must be positive")
     nonnegative = (
@@ -117,10 +109,16 @@ def main() -> None:
         f"seed={arguments.seed}"
     )
 
-    bootstrap_environment = FootballEnv(arguments.maximum_steps, arguments.seed)
-    observation = bootstrap_environment.reset(arguments.seed)
-    frame_size = encode(observation).numel()
-    action_count = bootstrap_environment.action_count
+    if arguments.resume is not None:
+        metadata = torch.load(arguments.resume, map_location="cpu", weights_only=True)
+        frame_size = int(metadata["frame_size"])
+        action_count = int(metadata["action_count"])
+    else:
+        bootstrap_environment = FootballEnv(arguments.maximum_steps, arguments.seed)
+        observation = bootstrap_environment.reset(arguments.seed)
+        frame_size = encode(observation).numel()
+        action_count = bootstrap_environment.action_count
+        del bootstrap_environment
     policy = ActorCritic(frame_size, action_count).to(device)
     parameter_count = sum(parameter.numel() for parameter in policy.parameters())
     _status(f"policy architecture={POLICY_ARCHITECTURE} parameters={parameter_count}")
@@ -147,115 +145,25 @@ def main() -> None:
                 )
         policy.load_state_dict(checkpoint["model"])
         start_iteration = int(checkpoint.get("updates", 0)) + 1
-    del bootstrap_environment
-
     optimizer = torch.optim.Adam(policy.parameters(), lr=arguments.learning_rate)
     if checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
+    sampled_matches = int(checkpoint.get("sampled_matches", 0))
+    pretraining_metrics = checkpoint.get("pretraining", {})
+
+    if arguments.updates == 0:
+        _status("training complete updates=0")
+        return
+
     environment = SelfPlayVectorFootballEnv(
         arguments.flight,
         arguments.maximum_steps,
         arguments.seed,
     )
-    sampled_matches = int(checkpoint.get("sampled_matches", 0))
     environment.advance_seed_sequence(sampled_matches)
     _status(
         f"self-play flight={arguments.flight} seed_sequence={arguments.seed} ready"
     )
-    pretraining_metrics = checkpoint.get("pretraining", {})
-    if arguments.resume is None and arguments.pretraining_games:
-        _status(
-            f"pretraining collection start games={arguments.pretraining_games} "
-            f"teacher=tamakeri"
-        )
-        teacher = TamakEriTeacher(
-            2 * arguments.flight,
-            arguments.maximum_steps,
-            device,
-            TAMAKERI_WEIGHTS,
-        )
-        teacher_rollout, teacher_segments, teacher_matches = (
-            collect_tamakeri_rollout(
-                environment,
-                teacher,
-                policy,
-                arguments.pretraining_games,
-                arguments.sequence_length,
-                progress=lambda message: _status(
-                    f"pretraining collection {message}"
-                ),
-            )
-        )
-        sampled_matches += len(teacher_matches)
-        _status(
-            f"pretraining optimize start transitions={teacher_rollout.transition_count} "
-            f"segments={len(teacher_segments)} "
-            f"scored={sum(result != 0 for result, _ in teacher_segments)}"
-        )
-        losses = pretrain(
-            policy,
-            optimizer,
-            teacher_rollout,
-            epochs=arguments.pretraining_epochs,
-            batch_size=arguments.pretraining_batch_size,
-            transition_coefficient=arguments.transition_coefficient,
-            action_value_coefficient=arguments.action_value_coefficient,
-            control_coefficient=arguments.control_coefficient,
-            space_coefficient=arguments.space_coefficient,
-            progress=lambda message: _status(f"pretraining optimize {message}"),
-        )
-        pretraining_metrics = {
-            "teacher": "tamakeri",
-            "games": len(teacher_matches),
-            "segments": len(teacher_segments),
-            "scored_segments": sum(
-                result != 0 for result, _ in teacher_segments
-            ),
-            "censored_segments": sum(
-                result == 0 for result, _ in teacher_segments
-            ),
-            "transitions": teacher_rollout.transition_count,
-            "losses": losses,
-        }
-        _status(
-            f"pretraining complete games={len(teacher_matches)} "
-            f"segments={pretraining_metrics['segments']} "
-            f"scored={pretraining_metrics['scored_segments']} "
-            f"accuracy={losses['accuracy']:.4f}"
-        )
-        del teacher_rollout, teacher
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        bootstrap_checkpoint = {
-            "architecture": POLICY_ARCHITECTURE,
-            "parameter_count": parameter_count,
-            "model": policy.state_dict(),
-            "frame_size": frame_size,
-            "action_count": action_count,
-            "maximum_steps": arguments.maximum_steps,
-            "sequence_length": arguments.sequence_length,
-            "flight": arguments.flight,
-            "games_per_update": arguments.games_per_update,
-            "sampled_matches": sampled_matches,
-            "seed": arguments.seed,
-            "ppo_epochs": arguments.ppo_epochs,
-            "ppo_batch_size": arguments.ppo_batch_size,
-            "entropy_coefficient": arguments.entropy_coefficient,
-            "transition_coefficient": arguments.transition_coefficient,
-            "action_value_coefficient": arguments.action_value_coefficient,
-            "control_coefficient": arguments.control_coefficient,
-            "space_coefficient": arguments.space_coefficient,
-            "objective": POLICY_OBJECTIVE,
-            "feature_scaling": "fixed",
-            "updates": 0,
-            "pretraining": pretraining_metrics,
-            "diagnostics": {},
-            "evaluation": {},
-            "optimizer": optimizer.state_dict(),
-        }
-        _status("pretraining checkpoint saving")
-        _atomic_torch_save(bootstrap_checkpoint, arguments.checkpoint)
-        _status(f"pretraining checkpoint saved={arguments.checkpoint}")
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
         if device.type == "cuda":

@@ -1,5 +1,3 @@
-"""Jackaroo single-agent PPO implementation."""
+"""Jackaroo single-agent deep reinforcement learning implementation."""
 
-from .env import FootballEnv
-
-__all__ = ["FootballEnv"]
+__all__: tuple[str, ...] = ()

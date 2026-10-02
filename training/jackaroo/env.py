@@ -392,3 +392,42 @@ class SelfPlayVectorFootballEnv:
                 self._segment_action_counts[index] = 0
         self._observations = observations
         return observations, results, segment_done, infos
+
+    def step_decision_one(
+        self,
+        index: int,
+        decisions: Sequence[Sequence[int]],
+    ) -> tuple[int, ObservationPair, int, bool, dict[str, Any]]:
+        """Advance one slot so independently completed simulations can continue."""
+
+        if not 0 <= index < self.count:
+            raise IndexError("environment index is out of range")
+        if len(decisions) != 2 or any(len(team) != 11 for team in decisions):
+            raise ValueError("a decision must contain two eleven-player teams")
+        previous = self._observations[index]
+        normalized = [list(decisions[0]), list(decisions[1])]
+        current_value, match_done_value = native.step_self_play_batch_one(
+            self._native, index, normalized
+        )
+        current = tuple(current_value)
+        match_done = bool(match_done_value)
+        left_result = _goal_result(previous[0], current[0])
+        right_result = _goal_result(previous[1], current[1])
+        if right_result != -left_result:
+            raise RuntimeError("self-play observations disagree about the goal")
+        applied = tuple(bool(previous[side]["is_in_play"]) for side in range(2))
+        if any(applied):
+            self._segment_action_counts[index] += 1
+        ended = left_result != 0 or match_done
+        info = {
+            "goals": current[0]["goals"],
+            "step": current[0]["step"],
+            "segment_result": left_result if ended else None,
+            "segment_steps": self._segment_action_counts[index] if ended else 0,
+            "match_done": match_done,
+            "action_applied": applied,
+        }
+        if ended:
+            self._segment_action_counts[index] = 0
+        self._observations[index] = current
+        return index, current, left_result, ended, info
