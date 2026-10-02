@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import time
 from typing import Any
 
 import torch
@@ -28,9 +27,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--flight", type=int, default=16)
     parser.add_argument("--maximum-steps", type=int, default=3000)
     parser.add_argument("--sequence-length", type=int, default=32)
+    parser.add_argument("--burn-in", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--ppo-batch-size", type=int, default=256)
+    parser.add_argument("--structure-epochs", type=int, default=1)
+    parser.add_argument("--ppo-batch-size", type=int, default=2048)
+    parser.add_argument("--value-clip", type=float, default=0.2)
     parser.add_argument("--entropy-coefficient", type=float, default=0.001)
     parser.add_argument("--transition-coefficient", type=float, default=0.1)
     parser.add_argument("--action-value-coefficient", type=float, default=0.1)
@@ -64,7 +66,7 @@ def _append_log(path: Path, record: dict[str, Any]) -> None:
 def _validate_arguments(arguments: argparse.Namespace) -> None:
     positive = (
         "flight", "maximum_steps",
-        "sequence_length", "ppo_epochs", "ppo_batch_size",
+        "sequence_length", "ppo_epochs", "structure_epochs", "ppo_batch_size",
     )
     for name in positive:
         if getattr(arguments, name) <= 0:
@@ -75,8 +77,12 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
             raise ValueError(f"{name.replace('_', '-')} must be nonnegative")
     if arguments.games_per_update == 0 and arguments.updates > 0:
         raise ValueError("games-per-update must be positive when updates are requested")
+    if arguments.burn_in not in (0, arguments.sequence_length):
+        raise ValueError("burn-in must be zero or equal to sequence-length")
     if arguments.learning_rate <= 0.0:
         raise ValueError("learning-rate must be positive")
+    if arguments.value_clip <= 0.0:
+        raise ValueError("value-clip must be positive")
     nonnegative = (
         "entropy_coefficient", "transition_coefficient",
         "action_value_coefficient", "control_coefficient",
@@ -166,38 +172,37 @@ def main() -> None:
     )
 
     for iteration in range(start_iteration, start_iteration + arguments.updates):
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
         _status(
             f"update={iteration} rollout start "
             f"target_games={arguments.games_per_update}"
         )
-        rollout_started = time.perf_counter()
         rollout, segments, matches = collect_self_play_rollout(
             environment,
             policy,
             arguments.games_per_update,
             sequence_length=arguments.sequence_length,
+            burn_in=arguments.burn_in,
             progress=lambda message: _status(f"update={iteration} rollout {message}"),
         )
-        rollout_seconds = time.perf_counter() - rollout_started
         sampled_matches += len(matches)
-        _status(f"update={iteration} ppo start")
-        ppo_started = time.perf_counter()
+        _status(f"update={iteration} optimization start")
         losses = update(
             policy,
             optimizer,
             rollout,
             epochs=arguments.ppo_epochs,
+            structure_epochs=arguments.structure_epochs,
             batch_size=arguments.ppo_batch_size,
+            value_clip=arguments.value_clip,
             entropy_coefficient=arguments.entropy_coefficient,
             transition_coefficient=arguments.transition_coefficient,
             action_value_coefficient=arguments.action_value_coefficient,
             control_coefficient=arguments.control_coefficient,
             space_coefficient=arguments.space_coefficient,
-            progress=lambda message: _status(f"update={iteration} ppo {message}"),
+            progress=lambda message: _status(
+                f"update={iteration} optimization {message}"
+            ),
         )
-        ppo_seconds = time.perf_counter() - ppo_started
         action_counts = torch.bincount(
             rollout.actions[rollout.valid].detach().cpu(), minlength=action_count
         ).float()
@@ -208,7 +213,6 @@ def main() -> None:
         mean_segment_steps = sum(length for _, length in retained_segments) / max(
             len(retained_segments), 1
         )
-        engine_steps = sum(length for _, length in segments)
         diagnostics = {
             "action_distribution": (action_counts / action_counts.sum()).tolist(),
             "transition_count": rollout.transition_count,
@@ -219,16 +223,6 @@ def main() -> None:
             ),
             "censored_segments": censored_segments,
             "mean_segment_steps": mean_segment_steps,
-            "rollout_seconds": rollout_seconds,
-            "engine_steps_per_second": engine_steps / max(rollout_seconds, 1e-9),
-            "ppo_seconds": ppo_seconds,
-            "ppo_transitions_per_second": (
-                rollout.transition_count / max(ppo_seconds, 1e-9)
-            ),
-            "peak_gpu_memory_bytes": (
-                torch.cuda.max_memory_allocated(device)
-                if device.type == "cuda" else 0
-            ),
         }
         _status(f"update={iteration} validation seed={arguments.validation_seed} start")
         evaluation = evaluate_policy(
@@ -257,10 +251,9 @@ def main() -> None:
             f"transition={losses['outcome'] + losses['terminal'] + losses['latent']:.4f} "
             f"q={losses['action_value']:.4f} control={losses['control']:.4f} "
             f"space={losses['space']:.4f} "
-            f"kl={losses['kl']:.5f} clipped={losses['clip_fraction']:.4f} "
-            f"engine_steps_s={diagnostics['engine_steps_per_second']:.1f} "
-            f"ppo_transitions_s={diagnostics['ppo_transitions_per_second']:.1f} "
-            f"gpu_peak_mib={diagnostics['peak_gpu_memory_bytes'] / 1048576.0:.1f} "
+            f"ppo_kl={losses['kl']:.5f} "
+            f"ppo_clipped={losses['clip_fraction']:.4f} "
+            f"ppo_value_clipped={losses['value_clip_fraction']:.4f} "
             f"validation={validation_scores}",
             flush=True,
         )
@@ -272,12 +265,15 @@ def main() -> None:
             "action_count": action_count,
             "maximum_steps": arguments.maximum_steps,
             "sequence_length": arguments.sequence_length,
+            "burn_in": arguments.burn_in,
             "flight": arguments.flight,
             "games_per_update": arguments.games_per_update,
             "sampled_matches": sampled_matches,
             "seed": arguments.seed,
             "ppo_epochs": arguments.ppo_epochs,
+            "structure_epochs": arguments.structure_epochs,
             "ppo_batch_size": arguments.ppo_batch_size,
+            "value_clip": arguments.value_clip,
             "entropy_coefficient": arguments.entropy_coefficient,
             "transition_coefficient": arguments.transition_coefficient,
             "action_value_coefficient": arguments.action_value_coefficient,
@@ -299,7 +295,7 @@ def main() -> None:
                 "update": iteration,
                 "segments": segments,
                 "matches": matches,
-                "ppo": losses,
+                "optimization": losses,
                 "diagnostics": diagnostics,
                 "evaluation": evaluation,
             },

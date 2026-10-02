@@ -114,7 +114,7 @@ $$
 
 其中 $m_t^i$ 是实体有效性 mask。mask 是取值为 $0$ 或 $1$ 的指示量，状态为 inactive 的球员取得 $0$。$E_t$ 是 Entity Transformer 关系摘要。$S_t^{\mathrm{space}}$ 是由 96 个球场位置 token 加权汇总得到的空间网格摘要。位置 token 是表示一个固定网格位置的向量，其中包含该位置的控制关系、空间质量和最可能到达该处的球员状态。当前决策节点的实体 token、持久实体状态、全局状态和空间网格摘要随后组成 Actor 的关系表示。第 4 节给出位置 token、权重和汇总过程的完整定义。
 
-PPO 使用长度为 $L$ 的连续序列执行 truncated backpropagation through time，当前取 $L=32$。每个序列保存采样时真实的起始循环状态 $(H_{t_0-1},h_{t_0-1}^{\mathrm{global}})$ 和有效步骤 mask。序列在同一个进球 segment 内切分。padding 步骤的 mask 取 $0$，进球后两侧的实体状态和全局状态同时归零。因此，反向传播长度受到控制，而正向隐藏状态仍沿完整 segment 连续传递。
+PPO 使用长度为 $L$ 的连续学习窗口执行 truncated backpropagation through time，当前取 $L=32$。每个学习窗口前面带有 $L_{\mathrm{burn}}=32$ 步 burn-in 历史。burn-in 表示用当前网络重新计算循环状态的历史区间，这个区间关闭梯度，后面的学习窗口正常参与反向传播。第一个窗口缺少的历史位置使用 mask 为 $0$ 的 padding，后续窗口从前一个 32 步块的起点状态开始重放历史。每个序列保存该历史起点的循环状态 $(H_{t_0-1},h_{t_0-1}^{\mathrm{global}})$ 和有效步骤 mask。序列始终位于同一个进球 segment 内。进球后两侧的实体状态和全局状态同时归零。因此，Actor 和 Critic 在更新时看到由当前参数重建的近期上下文，梯度长度保持为 32 步，正向隐藏状态仍沿完整 segment 连续传递。
 
 ## 4. 空间控制与动作结果
 
@@ -289,7 +289,7 @@ C_t(x_k)R^-(x_k),
 \qquad \text{对手持球}.
 $$
 
-训练器只在持球方明确的有效步骤上计算位置重要性辅助损失：
+训练器只在持球方明确的有效步骤上计算位置重要性损失：
 
 $$
 \mathcal L_{\mathrm{space}}
@@ -510,7 +510,7 @@ $$
 
 异步向量环境同时维护 $B_{\mathrm{parallel}}=16$ 场完整比赛。每个 native 环境在独立工作线程中执行引擎 step。主线程等待首批完成的环境，并把当时已经就绪的左右观察合并为下一次策略推理批次。完成较早的环境可以直接进入下一步，单步耗时较长的环境继续在自己的工作线程中运行。引擎 reset 使用进程级随机状态，因此 reset 在当前已经提交的 step 全部结束后串行执行。
 
-每次 PPO 更新采集 $N_{\mathrm{self}}=256$ 场比赛。一次 rollout 期间的策略参数保持冻结，全部比赛完成后才执行 PPO 更新，因此每条 trajectory 都来自同一个旧策略。每场比赛最多推进 $H=3000$ 个引擎步，双方在每个有效步骤各自产生一次策略决策。进球会同时结束两侧的当前 segment，并产生结果互为相反数的两条训练轨迹。结果未知的尾段进入动作条件转移、到达时间和空间表示等辅助目标。PPO policy、下一球 Critic 和动作价值目标使用独立 mask 选择结果为 $+1$ 或 $-1$ 的 segment。一次更新获得的进球 segment 数由该批完整比赛中的实际进球数决定。
+每次 PPO 更新采集 $N_{\mathrm{self}}=256$ 场比赛。一次 rollout 期间的策略参数保持冻结，全部比赛完成后才执行模型更新，因此每条 trajectory 都来自同一个旧策略。每场比赛最多推进 $H=3000$ 个引擎步，双方在每个有效步骤各自产生一次策略决策。进球会同时结束两侧的当前 segment，并产生结果互为相反数的两条训练轨迹。结果未知的尾段继续训练动作条件转移、到达时间和空间表示。PPO policy、下一球 Critic 和动作价值目标使用独立 mask 选择结果为 $+1$ 或 $-1$ 的 segment。一次更新获得的进球 segment 数由该批完整比赛中的实际进球数决定。
 
 对有效 transition，优势表示实际 segment 结果相对当前价值估计高出或低出的程度：
 
@@ -544,21 +544,58 @@ $$
 \right].
 $$
 
-最终训练目标把策略、单一下一球价值、动作结果、动作价值、控制场校准和空间表示合并为：
+Critic value clipping 使用采样时记录的旧价值 $V_{\mathrm{old}}(s_t)$ 约束一次 PPO 更新中的价值变化。令 $\epsilon_V=0.2$，裁剪后的候选值为：
 
 $$
-\mathcal L
+V_{\mathrm{clip}}(s_t)
 =
--\mathcal J_{\mathrm{clip}}
-+c_V\mathcal L_V
--c_H\mathcal H(\pi_\theta)
-+c_T\mathcal L_{\mathrm{transition}}
+V_{\mathrm{old}}(s_t)
++
+\mathrm{clip}\left(
+V_\phi(s_t)-V_{\mathrm{old}}(s_t),
+-\epsilon_V,
+\epsilon_V
+\right).
+$$
+
+Critic 对原始价值误差与裁剪价值误差取较大者：
+
+$$
+\mathcal L_V^{\mathrm{clip}}
+=
+\mathbb E_t\left[
+\max\left(
+\left(V_\phi(s_t)-G_k\right)^2,
+\left(V_{\mathrm{clip}}(s_t)-G_k\right)^2
+\right)
+\right].
+$$
+
+一次模型更新首先执行一轮足球结构学习阶段。这个阶段使用真实相邻观察、segment 结果、引擎公开到球时间和空间控制目标训练动作结果、动作价值、到达时间与空间表示：
+
+$$
+\mathcal L_{\mathrm{structure}}
+=
+c_T\mathcal L_{\mathrm{transition}}
 +c_Q\mathcal L_Q
 +c_C\mathcal L_{\mathrm{control}}
 +c_S\mathcal L_{\mathrm{space}}.
 $$
 
-近似 KL 衡量新旧策略概率分布的平均变化，clipping fraction 表示触发 PPO 比率裁剪的样本比例，两者共同反映一次更新的幅度。策略熵衡量动作分布的分散程度。训练评估同时统计各项损失、动作分布、进球 segment 数、完整自对弈比分、样本吞吐量和显存占用。
+足球结构学习完成后执行四轮 PPO 阶段。PPO 阶段使用最多 2048 个有效 transition 组成一个 mini-batch。由于每条学习序列包含 32 个有效 transition，一个完整 mini-batch 通常包含 64 条序列及其 burn-in 历史。该阶段的损失为：
+
+$$
+\mathcal L_{\mathrm{PPO}}
+=
+-\mathcal J_{\mathrm{clip}}
++c_V\mathcal L_V^{\mathrm{clip}}
+-c_H\mathcal H(\pi_\theta)
+.
+$$
+
+两个阶段共享 Entity Transformer、实体 GRU、Global GRUCell、空间控制模块和 EPV 价值头。因此，足球结构学习产生的参数更新会立即进入 Critic 的局面表征与价值估计，随后执行的 PPO 阶段在具有进球结果的 segment 上使用 clipping 目标继续优化 Actor 和 Critic。把 PPO 放在最后可以避免足球结构学习在 clipping 之后再次修改共享模型。PPO 结束后的完整模型直接用于本轮验证，并在下一轮 rollout 中重新记录新的动作概率和状态价值。
+
+PPO 阶段内部的近似 KL、policy clipping fraction 和 value clipping fraction 描述各个 mini-batch 更新时的变化。KL 在训练过程中只承担观测指标的职责，PPO clipping 为具有进球结果的样本提供稳定更新目标。策略熵衡量动作分布的分散程度。训练评估统计各项损失、动作分布、进球 segment 数、完整自对弈比分和固定种子完整比赛结果。
 
 ## 8. 训练与评估
 

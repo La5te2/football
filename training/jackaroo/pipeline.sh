@@ -37,8 +37,11 @@ exec "$PYTHON_BIN" -u -m training.jackaroo.train \
   --updates 3000 \
   --games-per-update 256 \
   --sequence-length 32 \
+  --burn-in 32 \
   --ppo-epochs 4 \
-  --ppo-batch-size 256 \
+  --structure-epochs 1 \
+  --ppo-batch-size 2048 \
+  --value-clip 0.2 \
   --learning-rate 0.0001 \
   --entropy-coefficient 0.001 \
   --space-coefficient 0.05 \

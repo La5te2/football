@@ -535,17 +535,28 @@ class ActorCritic(nn.Module):
         opponent_anchor_indices: torch.Tensor,
         initial_state: RecurrentState,
         valid: torch.Tensor,
+        burn_in: int = 0,
     ) -> SequenceOutput:
         """Evaluate padded, contiguous sequences with truncated recurrence."""
 
+        if not 0 <= burn_in <= encoded.shape[1]:
+            raise ValueError("burn-in is outside the sequence")
         state = initial_state
         outputs: list[PolicyOutput] = []
         for index in range(encoded.shape[1]):
-            output = self.step(
-                encoded[:, index], own[:, index], opponent[:, index],
-                context[:, index], anchor_indices[:, index],
-                opponent_anchor_indices[:, index], state,
-            )
+            if index < burn_in:
+                with torch.no_grad():
+                    output = self.step(
+                        encoded[:, index], own[:, index], opponent[:, index],
+                        context[:, index], anchor_indices[:, index],
+                        opponent_anchor_indices[:, index], state,
+                    )
+            else:
+                output = self.step(
+                    encoded[:, index], own[:, index], opponent[:, index],
+                    context[:, index], anchor_indices[:, index],
+                    opponent_anchor_indices[:, index], state,
+                )
             keep = valid[:, index].to(encoded.dtype)
             state = RecurrentState(
                 output.state.entities * keep[:, None, None]
